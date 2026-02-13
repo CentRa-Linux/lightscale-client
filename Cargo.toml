@@ -1,0 +1,35 @@
+[package]
+name = "lightscale-client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+boringtun = { version = "0.7", features = ["device"] }
+clap = { version = "4", features = ["derive", "env"] }
+dirs = "5"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+futures-util = "0.3"
+hmac = "0.12"
+hickory-proto = "0.24"
+hex = "0.4"
+ipnet = "2"
+md-5 = "0.10"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rustls = "0.23"
+rtnetlink = "0.20"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sha1 = "0.10"
+socket2 = "0.5"
+time = { version = "0.3", features = ["serde", "formatting"] }
+tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "signal"] }
+tokio-rustls = "0.26"
+url = "2"
+webpki-roots = "0.26"
+wireguard-control = "1.7"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+netlink-packet-route = "0.28"
