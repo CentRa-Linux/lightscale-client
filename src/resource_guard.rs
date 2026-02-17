@@ -421,7 +421,7 @@ pub async fn cleanup_existing_resources(interface: Option<&str>) -> Result<()> {
 }
 
 /// Clean up any existing resources by interface name pattern.
-pub async fn cleanup_all_lightscale_interfaces() -> Result<()> {
+pub async fn cleanup_all_lightscale_interfaces(exclude: Option<&str>) -> Result<()> {
     // List all wireguard interfaces and remove those matching our pattern
     #[cfg(target_os = "linux")]
     {
@@ -436,16 +436,27 @@ pub async fn cleanup_all_lightscale_interfaces() -> Result<()> {
             let stdout = String::from_utf8_lossy(&output.stdout);
 
             for line in stdout.lines() {
-                // Look for interface names starting with "ls-"
-                if let Some(iface) = line
-                    .split(':')
-                    .next()
-                    .and_then(|s| s.trim().strip_prefix("ls-"))
-                    .map(|s| format!("ls-{}", s))
-                {
-                    eprintln!("pre-start: cleaning up existing interface {}", iface);
-                    for backend in [crate::wg::Backend::Kernel, crate::wg::Backend::Boringtun] {
-                        let _ = crate::wg::remove(&iface, backend).await;
+                // Parse "N: ifname@...: <..." or "N: ifname: <..." format
+                // Example: "4: ls-guard: <POINTOPOINT,NOARP> mtu 1420..."
+                if let Some(idx_colon) = line.find(':') {
+                    let after_idx = &line[idx_colon + 1..];
+                    // Find the next colon which marks the end of the name
+                    if let Some(name_end) = after_idx.find(':') {
+                        let name = after_idx[..name_end].trim();
+                        // Remove @... part if present (for virtual interfaces)
+                        let name = name.split('@').next().unwrap_or(name);
+                        
+                        if name.starts_with("ls-") {
+                            // Skip the interface we're about to create
+                            if exclude == Some(name) {
+                                eprintln!("pre-start: skipping current interface {}", name);
+                                continue;
+                            }
+                            eprintln!("pre-start: cleaning up existing interface {}", name);
+                            for backend in [crate::wg::Backend::Kernel, crate::wg::Backend::Boringtun] {
+                                let _ = crate::wg::remove(name, backend).await;
+                            }
+                        }
                     }
                 }
             }
