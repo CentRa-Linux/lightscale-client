@@ -7,11 +7,12 @@ mod l2_relay;
 mod model;
 mod netlink;
 mod relay_tunnel;
+mod resource_guard;
 mod router;
 mod routes;
 mod state;
-mod stun;
 mod stream_relay;
+mod stun;
 mod turn;
 mod udp_relay;
 mod wg;
@@ -28,10 +29,12 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use time::OffsetDateTime;
 use tokio::net::{TcpStream, UdpSocket};
+use tokio::process::Command as TokioCommand;
 use tokio::time::sleep;
 
 #[derive(Parser, Debug)]
@@ -43,7 +46,13 @@ struct Args {
     config: Option<PathBuf>,
     #[arg(long)]
     state_dir: Option<PathBuf>,
-    #[arg(long, value_name = "URL", value_delimiter = ',', action = ArgAction::Append)]
+    #[arg(
+        long,
+        alias = "bootstrap-url",
+        value_name = "URL",
+        value_delimiter = ',',
+        action = ArgAction::Append
+    )]
     control_url: Vec<String>,
     #[arg(long)]
     tls_pin: Option<String>,
@@ -211,6 +220,8 @@ enum Command {
         endpoint_stale_after: u64,
         #[arg(long, default_value_t = 2)]
         endpoint_max_rotations: u64,
+        #[arg(long, default_value_t = 60)]
+        relay_reprobe_after: u64,
         #[arg(long)]
         dns_hosts_path: Option<PathBuf>,
         #[arg(long)]
@@ -221,6 +232,21 @@ enum Command {
         dns_apply_resolver: bool,
         #[arg(long)]
         l2_relay: bool,
+        #[arg(long, help = "Clean up existing resources before starting")]
+        cleanup_before_start: bool,
+        #[arg(long, value_name = "PATH", help = "PID file path for single-instance enforcement")]
+        pid_file: Option<PathBuf>,
+    },
+    Daemon {
+        #[arg(long, value_delimiter = ',')]
+        profiles: Vec<String>,
+        #[arg(
+            long = "agent-arg",
+            action = ArgAction::Append,
+            value_name = "ARG",
+            allow_hyphen_values = true
+        )]
+        agent_arg: Vec<String>,
     },
     Router {
         #[command(subcommand)]
@@ -499,15 +525,14 @@ async fn main() -> Result<()> {
             if control_urls.is_empty() {
                 return Err(anyhow!("control URL not set; provide at least one URL"));
             }
-            config
-                .profiles
-                .insert(
-                    args.profile.clone(),
-                    ProfileConfig {
-                        control_urls,
-                        tls_pinned_sha256: None,
-                    },
-                );
+            config.profiles.insert(
+                args.profile.clone(),
+                ProfileConfig {
+                    control_urls,
+                    tls_pinned_sha256: None,
+                    ..ProfileConfig::default()
+                },
+            );
             save_config(&config_path, &config)?;
             println!("saved config for profile {}", args.profile);
         }
@@ -521,12 +546,11 @@ async fn main() -> Result<()> {
                 .or_insert(ProfileConfig {
                     control_urls: control_urls.clone(),
                     tls_pinned_sha256: None,
+                    ..ProfileConfig::default()
                 });
             profile.control_urls = control_urls.clone();
             if profile.tls_pinned_sha256.is_some() && !*force {
-                return Err(anyhow!(
-                    "tls pin already set; use --force to overwrite"
-                ));
+                return Err(anyhow!("tls pin already set; use --force to overwrite"));
             }
             let pin = fetch_server_fingerprint_any(&control_urls).await?;
             profile.tls_pinned_sha256 = Some(pin.clone());
@@ -579,6 +603,7 @@ async fn main() -> Result<()> {
             };
 
             save_state(&state_path, &state)?;
+            persist_profile_control_urls(&args, &control_urls, tls_pin.as_deref())?;
             if state
                 .last_netmap
                 .as_ref()
@@ -615,7 +640,8 @@ async fn main() -> Result<()> {
             let wg_keys = keys::generate_wg_keys();
             let node_name = node_name.clone().unwrap_or_else(default_node_name);
 
-            let client = ControlClient::new(control_urls.clone(), tls_pin, None, admin_token)?;
+            let client =
+                ControlClient::new(control_urls.clone(), tls_pin.clone(), None, admin_token)?;
             let response = client
                 .register_url(model::RegisterUrlRequest {
                     network_id: network_id.clone(),
@@ -645,6 +671,7 @@ async fn main() -> Result<()> {
             };
 
             save_state(&state_path, &state)?;
+            persist_profile_control_urls(&args, &control_urls, tls_pin.as_deref())?;
             let auth_urls: Vec<String> = control_urls
                 .iter()
                 .map(|base| format!("{}{}", base.trim_end_matches('/'), response.auth_path))
@@ -697,13 +724,13 @@ async fn main() -> Result<()> {
                             .await
                             .context("update node failed")?;
                         let node = response.node;
-                        println!(
-                            "node {} name={} tags={:?}",
-                            node.id, node.name, node.tags
-                        );
+                        println!("node {} name={} tags={:?}", node.id, node.name, node.tags);
                     }
                 },
-                AdminCommand::Nodes { network_id, pending } => {
+                AdminCommand::Nodes {
+                    network_id,
+                    pending,
+                } => {
                     let response = client
                         .admin_nodes(network_id)
                         .await
@@ -790,10 +817,7 @@ async fn main() -> Result<()> {
                     } => {
                         let policy = load_acl_policy(file.as_ref(), json.as_ref())?;
                         let response = client
-                            .update_acl(
-                                network_id,
-                                model::UpdateAclRequest { policy },
-                            )
+                            .update_acl(network_id, model::UpdateAclRequest { policy })
                             .await
                             .context("update acl policy failed")?;
                         println!("{}", serde_json::to_string_pretty(&response.policy)?);
@@ -813,7 +837,9 @@ async fn main() -> Result<()> {
                         clear,
                     } => {
                         let policy = if *clear {
-                            model::KeyRotationPolicy { max_age_seconds: None }
+                            model::KeyRotationPolicy {
+                                max_age_seconds: None,
+                            }
                         } else {
                             model::KeyRotationPolicy {
                                 max_age_seconds: *max_age_seconds,
@@ -874,11 +900,7 @@ async fn main() -> Result<()> {
                     limit,
                 } => {
                     let response = client
-                        .audit_log(
-                            network_id.as_deref(),
-                            node_id.as_deref(),
-                            *limit,
-                        )
+                        .audit_log(network_id.as_deref(), node_id.as_deref(), *limit)
                         .await
                         .context("fetch audit log failed")?;
                     println!("{}", serde_json::to_string_pretty(&response.entries)?);
@@ -903,19 +925,17 @@ async fn main() -> Result<()> {
             let mut state = load_state(&state_path)?
                 .ok_or_else(|| anyhow!("state not found for profile {}", args.profile))?;
             let admin_token = resolve_admin_token(&args);
-            let admin_token = resolve_admin_token(&args);
 
             let mut endpoints = endpoint.clone();
             if *stun {
-                let stun_servers =
-                    gather_stun_servers(
-                        &control_urls,
-                        tls_pin.clone(),
-                        &mut state,
-                        &state_path,
-                        stun_server,
-                    )
-                    .await?;
+                let stun_servers = gather_stun_servers(
+                    &control_urls,
+                    tls_pin.clone(),
+                    &mut state,
+                    &state_path,
+                    stun_server,
+                )
+                .await?;
                 if let Some(stun_endpoint) = maybe_stun_endpoint(
                     &stun_servers,
                     stun_port.or(Some(0)),
@@ -1037,10 +1057,27 @@ async fn main() -> Result<()> {
                                     .endpoint
                                     .map(|ep| ep.to_string())
                                     .unwrap_or_else(|| "none".to_string());
-                                let handshake = format_handshake_age(peer.stats.last_handshake_time);
+                                let handshake =
+                                    format_handshake_age(peer.stats.last_handshake_time);
+                                let allowed_ips = if peer.config.allowed_ips.is_empty() {
+                                    "none".to_string()
+                                } else {
+                                    peer.config
+                                        .allowed_ips
+                                        .iter()
+                                        .map(|ip| format!("{}/{}", ip.address, ip.cidr))
+                                        .collect::<Vec<_>>()
+                                        .join(",")
+                                };
                                 println!(
-                                    "peer {} {} handshake={} endpoint={}",
-                                    name, key, handshake, endpoint
+                                    "peer {} {} handshake={} endpoint={} rx={} tx={} allowed_ips={}",
+                                    name,
+                                    key,
+                                    handshake,
+                                    endpoint,
+                                    peer.stats.rx_bytes,
+                                    peer.stats.tx_bytes,
+                                    allowed_ips
                                 );
                             }
                         }
@@ -1089,12 +1126,8 @@ async fn main() -> Result<()> {
                 },
             };
 
-            let client = ControlClient::new(
-                control_urls,
-                tls_pin,
-                state.node_token.clone(),
-                admin_token,
-            )?;
+            let client =
+                ControlClient::new(control_urls, tls_pin, state.node_token.clone(), admin_token)?;
             let response = client
                 .rotate_keys(&state.node_id, request)
                 .await
@@ -1138,12 +1171,8 @@ async fn main() -> Result<()> {
                 .ok_or_else(|| anyhow!("state not found for profile {}", args.profile))?;
             let admin_token = resolve_admin_token(&args);
 
-            let client = ControlClient::new(
-                control_urls,
-                tls_pin,
-                state.node_token.clone(),
-                admin_token,
-            )?;
+            let client =
+                ControlClient::new(control_urls, tls_pin, state.node_token.clone(), admin_token)?;
             let netmap = client
                 .netmap(&state.node_id)
                 .await
@@ -1236,11 +1265,14 @@ async fn main() -> Result<()> {
             stream_relay_server,
             endpoint_stale_after,
             endpoint_max_rotations,
+            relay_reprobe_after,
             dns_hosts_path,
             dns_serve,
             dns_listen,
             dns_apply_resolver,
             l2_relay,
+            cleanup_before_start,
+            pid_file,
         } => {
             if *heartbeat_interval == 0 {
                 return Err(anyhow!("heartbeat_interval must be > 0"));
@@ -1254,6 +1286,28 @@ async fn main() -> Result<()> {
             if *endpoint_max_rotations == 0 {
                 return Err(anyhow!("endpoint_max_rotations must be > 0"));
             }
+            if *relay_reprobe_after == 0 {
+                return Err(anyhow!("relay_reprobe_after must be > 0"));
+            }
+
+            // PID file check for single-instance enforcement
+            if let Some(pid_path) = pid_file {
+                match resource_guard::PidFileGuard::acquire(pid_path) {
+                    Ok(Some(_guard)) => {
+                        // PID file acquired, it will be cleaned up on drop
+                        println!("acquired PID file lock at {}", pid_path.display());
+                    }
+                    Ok(None) => {
+                        return Err(anyhow!(
+                            "another instance is already running (PID file locked at {})",
+                            pid_path.display()
+                        ));
+                    }
+                    Err(e) => {
+                        eprintln!("warning: failed to acquire PID file: {}", e);
+                    }
+                }
+            }
 
             let config = load_optional_config(&args)?;
             let control_urls = resolve_control_urls(&args, config.as_ref())?;
@@ -1261,6 +1315,23 @@ async fn main() -> Result<()> {
             let state_path = resolve_state_path(&args)?;
             let mut state = load_state(&state_path)?
                 .ok_or_else(|| anyhow!("state not found for profile {}", args.profile))?;
+
+            let iface = interface
+                .clone()
+                .unwrap_or_else(|| default_interface_name(&args.profile));
+
+            // Pre-start cleanup of existing resources
+            if *cleanup_before_start {
+                eprintln!("cleaning up existing resources before start...");
+                // Clean up the specific interface first
+                resource_guard::cleanup_existing_resources(Some(&iface)).await?;
+                // Then clean up all other ls-* interfaces (leftovers from crashes, etc.)
+                resource_guard::cleanup_all_lightscale_interfaces().await?;
+            }
+
+            // Create resource guard for automatic cleanup on panic/unexpected exit
+            let resource_guard = resource_guard::AsyncManagedResources::new();
+            resource_guard.set_interface(iface.clone(), (*backend).into()).await;
             let admin_token = resolve_admin_token(&args);
             let profile = args.profile.clone();
             let stun_servers = gather_stun_servers(
@@ -1308,10 +1379,9 @@ async fn main() -> Result<()> {
             };
             let endpoint_stale_after = Duration::from_secs(*endpoint_stale_after);
             let endpoint_max_rotations = (*endpoint_max_rotations) as usize;
+            let relay_reprobe_after = Duration::from_secs(*relay_reprobe_after);
 
-            let iface = interface
-                .clone()
-                .unwrap_or_else(|| default_interface_name(&args.profile));
+            // Note: iface is already defined above for resource_guard
             let client = ControlClient::new(
                 control_urls.clone(),
                 tls_pin.clone(),
@@ -1344,8 +1414,11 @@ async fn main() -> Result<()> {
                 exit_uid_rule_priority,
             };
             let advertise_maps = parse_route_maps(advertise_map)?;
-            let advertise_routes =
-                build_routes(advertise_route.clone(), advertise_maps, *advertise_exit_node);
+            let advertise_routes = build_routes(
+                advertise_route.clone(),
+                advertise_maps,
+                *advertise_exit_node,
+            );
             let mut dns_state: Option<std::sync::Arc<std::sync::Mutex<model::NetMap>>> = None;
             let mut dns_listen_addr: Option<SocketAddr> = None;
             let mut l2_state: Option<std::sync::Arc<std::sync::Mutex<model::NetMap>>> = None;
@@ -1355,8 +1428,8 @@ async fn main() -> Result<()> {
                     .unwrap_or_else(|| "127.0.0.1:53".to_string());
                 let listen_addr: SocketAddr =
                     listen.parse().context("invalid dns listen address")?;
-                let netmap = ensure_netmap(&control_urls, tls_pin.clone(), &mut state, &state_path)
-                    .await?;
+                let netmap =
+                    ensure_netmap(&control_urls, tls_pin.clone(), &mut state, &state_path).await?;
                 dns_state = Some(dns_server::spawn(listen_addr, netmap.clone())?);
                 dns_listen_addr = Some(listen_addr);
                 if *dns_apply_resolver {
@@ -1372,13 +1445,28 @@ async fn main() -> Result<()> {
                 }
                 println!("dns server listening on {}", listen_addr);
             }
-            let mut last_revision = state
-                .last_netmap
-                .as_ref()
-                .map(|netmap| netmap.revision)
-                .unwrap_or(0);
+            let startup_netmap = if let Some(netmap) = state.last_netmap.clone() {
+                netmap
+            } else {
+                ensure_netmap(&control_urls, tls_pin.clone(), &mut state, &state_path).await?
+            };
+            apply_netmap_update(
+                &state_path,
+                &mut state,
+                startup_netmap.clone(),
+                &wg_cfg,
+                *apply_routes,
+                &routes_cfg,
+                *probe_peers,
+                *probe_timeout,
+                &profile,
+                dns_hosts_path.as_ref(),
+            )
+            .await?;
+            let mut last_revision = startup_netmap.revision;
 
             let mut interval = tokio::time::interval(Duration::from_secs(*heartbeat_interval));
+            let mut shutdown = Box::pin(wait_for_shutdown_signal());
             println!(
                 "agent running for node {} on network {}",
                 state.node_id, state.network_id
@@ -1386,6 +1474,10 @@ async fn main() -> Result<()> {
 
             loop {
                 tokio::select! {
+                    _ = &mut shutdown => {
+                        println!("shutdown signal received, stopping agent");
+                        break;
+                    }
                     _ = interval.tick() => {
                         let mut endpoints = endpoint.clone();
                         if *stun {
@@ -1495,6 +1587,7 @@ async fn main() -> Result<()> {
                             &relay_endpoints,
                             endpoint_stale_after,
                             endpoint_max_rotations,
+                            relay_reprobe_after,
                         ) {
                             eprintln!("endpoint refresh failed: {}", err);
                         }
@@ -1545,12 +1638,31 @@ async fn main() -> Result<()> {
                             &relay_endpoints,
                             endpoint_stale_after,
                             endpoint_max_rotations,
+                            relay_reprobe_after,
                         ) {
                             eprintln!("endpoint refresh failed: {}", err);
                         }
                     }
                 }
             }
+
+            if *dns_apply_resolver {
+                if let Err(err) = dns_server::clear_resolver(&iface) {
+                    eprintln!("failed to clear dns resolver: {}", err);
+                }
+            }
+            // Disable automatic cleanup since we're doing clean shutdown
+            resource_guard.disable_cleanup().await;
+            if let Err(err) = wg::remove(&iface, (*backend).into()).await {
+                eprintln!("wireguard cleanup failed: {}", err);
+            }
+            println!("agent stopped");
+        }
+        Command::Daemon {
+            profiles,
+            agent_arg,
+        } => {
+            run_daemon(&args, profiles, agent_arg).await?;
         }
         Command::Router { command } => match command {
             RouterCommand::Enable {
@@ -1603,13 +1715,8 @@ async fn main() -> Result<()> {
             let state_path = resolve_state_path(&args)?;
             let mut state = load_state(&state_path)?
                 .ok_or_else(|| anyhow!("state not found for profile {}", args.profile))?;
-            let servers = gather_udp_relay_servers(
-                &control_urls,
-                tls_pin,
-                &mut state,
-                &state_path,
-            )
-            .await?;
+            let servers =
+                gather_udp_relay_servers(&control_urls, tls_pin, &mut state, &state_path).await?;
 
             match command {
                 RelayUdpCommand::Send {
@@ -1641,13 +1748,9 @@ async fn main() -> Result<()> {
             let state_path = resolve_state_path(&args)?;
             let mut state = load_state(&state_path)?
                 .ok_or_else(|| anyhow!("state not found for profile {}", args.profile))?;
-            let servers = gather_stream_relay_servers(
-                &control_urls,
-                tls_pin,
-                &mut state,
-                &state_path,
-            )
-            .await?;
+            let servers =
+                gather_stream_relay_servers(&control_urls, tls_pin, &mut state, &state_path)
+                    .await?;
 
             match command {
                 RelayStreamCommand::Send {
@@ -1696,21 +1799,16 @@ async fn main() -> Result<()> {
                         .or_else(|| servers.first().cloned())
                         .ok_or_else(|| anyhow!("no turn server configured"))?;
                     let peer: SocketAddr = peer_addr.parse().context("invalid peer addr")?;
-                    let mut allocation = turn::allocate(
-                        &server,
-                        creds.as_ref(),
-                        Duration::from_secs(*timeout),
-                    )
-                    .await?;
+                    let mut allocation =
+                        turn::allocate(&server, creds.as_ref(), Duration::from_secs(*timeout))
+                            .await?;
                     turn::create_permission(&mut allocation, peer, Duration::from_secs(*timeout))
                         .await?;
                     turn::send_data(&mut allocation, peer, message.as_bytes()).await?;
                     println!("turn relay message sent to {}", peer);
                 }
                 RelayTurnCommand::Listen {
-                    server,
-                    peer_addr,
-                    ..
+                    server, peer_addr, ..
                 } => {
                     let server = server
                         .clone()
@@ -1719,8 +1817,7 @@ async fn main() -> Result<()> {
                     let mut allocation =
                         turn::allocate(&server, creds.as_ref(), Duration::from_secs(3)).await?;
                     if let Some(peer_addr) = peer_addr {
-                        let peer: SocketAddr =
-                            peer_addr.parse().context("invalid peer addr")?;
+                        let peer: SocketAddr = peer_addr.parse().context("invalid peer addr")?;
                         turn::create_permission(&mut allocation, peer, Duration::from_secs(3))
                             .await?;
                     } else {
@@ -1752,12 +1849,8 @@ async fn main() -> Result<()> {
                 .ok_or_else(|| anyhow!("state not found for profile {}", args.profile))?;
 
             let admin_token = resolve_admin_token(&args);
-            let client = ControlClient::new(
-                control_urls,
-                tls_pin,
-                state.node_token.clone(),
-                admin_token,
-            )?;
+            let client =
+                ControlClient::new(control_urls, tls_pin, state.node_token.clone(), admin_token)?;
             let netmap = client
                 .netmap(&state.node_id)
                 .await
@@ -1795,12 +1888,8 @@ async fn main() -> Result<()> {
                 .ok_or_else(|| anyhow!("state not found for profile {}", args.profile))?;
 
             let admin_token = resolve_admin_token(&args);
-            let client = ControlClient::new(
-                control_urls,
-                tls_pin,
-                state.node_token.clone(),
-                admin_token,
-            )?;
+            let client =
+                ControlClient::new(control_urls, tls_pin, state.node_token.clone(), admin_token)?;
             let netmap = client
                 .netmap(&state.node_id)
                 .await
@@ -1814,9 +1903,7 @@ async fn main() -> Result<()> {
             let _state = dns_server::spawn(listen_addr, netmap.clone())?;
             if *apply_resolver {
                 if listen_addr.port() != 53 {
-                    return Err(anyhow!(
-                        "dns listen port must be 53 to apply resolver"
-                    ));
+                    return Err(anyhow!("dns listen port must be 53 to apply resolver"));
                 }
                 let iface = interface
                     .clone()
@@ -1835,12 +1922,8 @@ async fn main() -> Result<()> {
                 .ok_or_else(|| anyhow!("state not found for profile {}", args.profile))?;
 
             let admin_token = resolve_admin_token(&args);
-            let client = ControlClient::new(
-                control_urls,
-                tls_pin,
-                state.node_token.clone(),
-                admin_token,
-            )?;
+            let client =
+                ControlClient::new(control_urls, tls_pin, state.node_token.clone(), admin_token)?;
             let netmap = client
                 .netmap(&state.node_id)
                 .await
@@ -1858,22 +1941,49 @@ async fn main() -> Result<()> {
 }
 
 fn resolve_config_path(args: &Args) -> Result<PathBuf> {
-    if let Some(path) = &args.config {
-        return Ok(path.clone());
-    }
-    default_config_path().ok_or_else(|| anyhow!("no default config path available"))
+    resolve_config_path_optional(args).ok_or_else(|| anyhow!("no default config path available"))
+}
+
+fn resolve_config_path_optional(args: &Args) -> Option<PathBuf> {
+    args.config.clone().or_else(default_config_path)
 }
 
 fn load_optional_config(args: &Args) -> Result<Option<ClientConfig>> {
-    let config_path = match &args.config {
-        Some(path) => path.clone(),
-        None => match default_config_path() {
-            Some(path) => path,
-            None => return Ok(None),
-        },
+    let config_path = match resolve_config_path_optional(args) {
+        Some(path) => path,
+        None => return Ok(None),
     };
 
     Ok(Some(load_config(&config_path)?))
+}
+
+fn persist_profile_control_urls(
+    args: &Args,
+    control_urls: &[String],
+    tls_pin: Option<&str>,
+) -> Result<()> {
+    let config_path = match resolve_config_path_optional(args) {
+        Some(path) => path,
+        None => return Ok(()),
+    };
+    let mut config = load_config(&config_path)?;
+    let profile = config
+        .profiles
+        .entry(args.profile.clone())
+        .or_insert(ProfileConfig {
+            control_urls: Vec::new(),
+            tls_pinned_sha256: None,
+            ..ProfileConfig::default()
+        });
+    let urls = normalize_control_urls(control_urls.to_vec());
+    if !urls.is_empty() {
+        profile.control_urls = urls;
+    }
+    if let Some(pin) = tls_pin {
+        profile.tls_pinned_sha256 = Some(pin.to_string());
+    }
+    save_config(&config_path, &config)?;
+    Ok(())
 }
 
 fn resolve_control_urls(args: &Args, config: Option<&ClientConfig>) -> Result<Vec<String>> {
@@ -1894,7 +2004,7 @@ fn resolve_control_urls(args: &Args, config: Option<&ClientConfig>) -> Result<Ve
     }
 
     Err(anyhow!(
-        "control URL not set; use --control-url or init the profile"
+        "control URL not set; use --control-url/--bootstrap-url or init the profile"
     ))
 }
 
@@ -1932,10 +2042,220 @@ fn resolve_state_path(args: &Args) -> Result<PathBuf> {
     let base = if let Some(dir) = &args.state_dir {
         dir.clone()
     } else {
-        default_state_dir(&args.profile)
-            .ok_or_else(|| anyhow!("no default state dir available"))?
+        default_state_dir(&args.profile).ok_or_else(|| anyhow!("no default state dir available"))?
     };
     Ok(state_path(&base))
+}
+
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut terminate = match signal(SignalKind::terminate()) {
+            Ok(stream) => stream,
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+async fn run_daemon(
+    args: &Args,
+    requested_profiles: &[String],
+    default_agent_args: &[String],
+) -> Result<()> {
+    let config_path = resolve_config_path(args)?;
+    let config = load_config(&config_path)?;
+
+    let mut profile_names = if !requested_profiles.is_empty() {
+        requested_profiles.to_vec()
+    } else {
+        let mut names: Vec<String> = config
+            .profiles
+            .iter()
+            .filter_map(|(name, profile)| {
+                if profile.autostart {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        // Keep single-profile UX simple: daemon defaults to the selected profile
+        // (default: "default") when no autostart profiles are configured.
+        if names.is_empty() {
+            names.push(args.profile.clone());
+        }
+        names.sort();
+        names
+    };
+    profile_names.sort();
+    profile_names.dedup();
+
+    if profile_names.is_empty() {
+        return Err(anyhow!(
+            "no profiles selected; pass --profiles or set --profile"
+        ));
+    }
+
+    struct DaemonProfile {
+        name: String,
+        state_dir: PathBuf,
+        agent_args: Vec<String>,
+        child: Option<tokio::process::Child>,
+        waiting_logged: bool,
+    }
+
+    let exe = std::env::current_exe().context("failed to resolve current executable path")?;
+    let mut profiles: Vec<DaemonProfile> = Vec::new();
+
+    for profile_name in profile_names {
+        let profile_cfg = config.profiles.get(&profile_name);
+
+        let state_dir = profile_cfg
+            .and_then(|profile| profile.state_dir.clone())
+            .or_else(|| args.state_dir.clone())
+            .or_else(|| default_state_dir(&profile_name))
+            .ok_or_else(|| anyhow!("no state dir available for profile {}", profile_name))?;
+        let agent_args = profile_cfg
+            .map(|profile| profile.agent_args.clone())
+            .unwrap_or_default();
+        let agent_args = if agent_args.is_empty() {
+            default_agent_args.to_vec()
+        } else {
+            agent_args
+        };
+
+        profiles.push(DaemonProfile {
+            name: profile_name,
+            state_dir,
+            agent_args,
+            child: None,
+            waiting_logged: false,
+        });
+    }
+
+    if profiles.is_empty() {
+        return Err(anyhow!("no profile selected"));
+    }
+
+    println!("daemon managing {} profile(s)", profiles.len());
+    let mut shutdown = Box::pin(wait_for_shutdown_signal());
+    let mut ticker = tokio::time::interval(Duration::from_secs(1));
+
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => {
+                println!("shutdown signal received, stopping daemon");
+                break;
+            }
+            _ = ticker.tick() => {
+                for profile in &mut profiles {
+                    if let Some(child) = profile.child.as_mut() {
+                        match child
+                            .try_wait()
+                            .with_context(|| format!("failed to poll agent process for profile {}", profile.name))?
+                        {
+                            Some(status) => {
+                                eprintln!("agent for profile {} exited: {}", profile.name, status);
+                                profile.child = None;
+                            }
+                            None => {}
+                        }
+                    }
+
+                    if profile.child.is_none() {
+                        let state_file = state_path(&profile.state_dir);
+                        if state_file.is_file() {
+                            let mut command = TokioCommand::new(&exe);
+                            command
+                                .arg("--profile")
+                                .arg(&profile.name)
+                                .arg("--config")
+                                .arg(&config_path)
+                                .arg("--state-dir")
+                                .arg(&profile.state_dir);
+
+                            for control_url in &args.control_url {
+                                command.arg("--control-url").arg(control_url);
+                            }
+                            if let Some(tls_pin) = args.tls_pin.as_ref() {
+                                command.arg("--tls-pin").arg(tls_pin);
+                            }
+                            if let Some(admin_token) = args.admin_token.as_ref() {
+                                command.arg("--admin-token").arg(admin_token);
+                            }
+
+                            command.arg("agent");
+                            for token in &profile.agent_args {
+                                command.arg(token);
+                            }
+
+                            command
+                                .stdin(Stdio::null())
+                                .stdout(Stdio::inherit())
+                                .stderr(Stdio::inherit());
+
+                            let child = command
+                                .spawn()
+                                .with_context(|| format!("failed to start agent for profile {}", profile.name))?;
+                            let pid = child.id().unwrap_or(0);
+                            println!("started profile {} (pid {})", profile.name, pid);
+                            profile.child = Some(child);
+                            profile.waiting_logged = false;
+                        } else if !profile.waiting_logged {
+                            println!(
+                                "profile {} waiting for state at {}",
+                                profile.name,
+                                state_file.display()
+                            );
+                            profile.waiting_logged = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for profile in &mut profiles {
+        if let Some(child) = profile.child.as_mut() {
+            match child.try_wait() {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    if let Err(err) = child.kill().await {
+                        eprintln!("failed to stop profile {}: {}", profile.name, err);
+                    }
+                }
+                Err(err) => {
+                    eprintln!("failed to poll profile {} before stop: {}", profile.name, err);
+                }
+            }
+        }
+    }
+
+    for profile in &mut profiles {
+        if let Some(child) = profile.child.as_mut() {
+            if let Err(err) = child.wait().await {
+                eprintln!("failed to wait for profile {}: {}", profile.name, err);
+            }
+        }
+    }
+
+    println!("daemon stopped");
+    Ok(())
 }
 
 fn load_acl_policy(file: Option<&PathBuf>, json: Option<&String>) -> Result<model::AclPolicy> {
@@ -1981,12 +2301,12 @@ fn parse_route_maps(entries: &[String]) -> Result<Vec<(String, String)>> {
         if real.is_empty() || mapped.is_empty() {
             return Err(anyhow!("route map must be REAL=MAPPED (got {})", entry));
         }
-        let real_net: IpNet = real.parse().with_context(|| {
-            format!("route map real prefix invalid: {}", real)
-        })?;
-        let mapped_net: IpNet = mapped.parse().with_context(|| {
-            format!("route map mapped prefix invalid: {}", mapped)
-        })?;
+        let real_net: IpNet = real
+            .parse()
+            .with_context(|| format!("route map real prefix invalid: {}", real))?;
+        let mapped_net: IpNet = mapped
+            .parse()
+            .with_context(|| format!("route map mapped prefix invalid: {}", mapped))?;
         let real_v4 = matches!(real_net, IpNet::V4(_));
         let mapped_v4 = matches!(mapped_net, IpNet::V4(_));
         if real_v4 != mapped_v4 {
@@ -2078,11 +2398,7 @@ fn profile_hash(profile: &str) -> u64 {
     hasher.finish()
 }
 
-fn build_routes(
-    prefixes: Vec<String>,
-    maps: Vec<(String, String)>,
-    exit_node: bool,
-) -> Vec<Route> {
+fn build_routes(prefixes: Vec<String>, maps: Vec<(String, String)>, exit_node: bool) -> Vec<Route> {
     let mut routes: Vec<Route> = prefixes
         .into_iter()
         .map(|prefix| Route {
@@ -2530,11 +2846,10 @@ async fn maybe_stun_endpoint(
 
     let servers = servers.to_vec();
     let port = bind_port.unwrap_or(0);
-    let result = tokio::task::spawn_blocking(move || {
-        stun::discover_endpoint(&servers, port, timeout)
-    })
-    .await
-    .map_err(|err| anyhow!("stun task failed: {}", err))?;
+    let result =
+        tokio::task::spawn_blocking(move || stun::discover_endpoint(&servers, port, timeout))
+            .await
+            .map_err(|err| anyhow!("stun task failed: {}", err))?;
 
     match result {
         Ok(addr) => Ok(Some(addr.to_string())),
