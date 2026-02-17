@@ -1326,7 +1326,9 @@ async fn main() -> Result<()> {
                 // Clean up the specific interface first
                 resource_guard::cleanup_existing_resources(Some(&iface)).await?;
                 // Then clean up all other ls-* interfaces (leftovers from crashes, etc.)
-                resource_guard::cleanup_all_lightscale_interfaces(Some(&iface)).await?;
+                if let Err(e) = resource_guard::cleanup_all_lightscale_interfaces(Some(&iface)).await {
+                    eprintln!("pre-start: warning - failed to cleanup all interfaces: {}", e);
+                }
             }
 
             // Create resource guard for automatic cleanup on panic/unexpected exit
