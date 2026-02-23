@@ -48,7 +48,7 @@ pub fn current() -> PlatformProfile {
             data_plane: SupportLevel::Partial,
             service_integration: SupportLevel::Unsupported,
             service_managers: &["none"],
-            note: "control-plane commands are expected to work; non-linux data-plane support is experimental",
+            note: "control-plane commands are expected to work; non-linux data-plane is experimental and OS service integration is pending",
         },
         _ => PlatformProfile {
             os,
@@ -68,10 +68,6 @@ pub fn require_linux_data_plane(command_name: &str) -> Result<()> {
 
 pub fn require_data_plane(command_name: &str) -> Result<()> {
     require_any_data_plane_for(current(), command_name)
-}
-
-pub fn require_linux_service_integration(command_name: &str) -> Result<()> {
-    require_service_integration_for(current(), command_name)
 }
 
 fn require_data_plane_for(profile: PlatformProfile, command_name: &str) -> Result<()> {
@@ -98,23 +94,10 @@ fn require_any_data_plane_for(profile: PlatformProfile, command_name: &str) -> R
     ))
 }
 
-fn require_service_integration_for(profile: PlatformProfile, command_name: &str) -> Result<()> {
-    if profile.service_integration == SupportLevel::Supported {
-        return Ok(());
-    }
-    Err(anyhow!(
-        "{} service integration is only supported on linux (host: {}-{})",
-        command_name,
-        profile.os,
-        profile.arch
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        current, require_any_data_plane_for, require_data_plane_for,
-        require_service_integration_for, PlatformProfile, SupportLevel,
+        current, require_any_data_plane_for, require_data_plane_for, PlatformProfile, SupportLevel,
     };
 
     fn partial_profile() -> PlatformProfile {
@@ -164,15 +147,6 @@ mod tests {
         let text = format!("{}", err);
         assert!(text.contains("wg-up"));
         assert!(text.contains("only supported on linux"));
-    }
-
-    #[test]
-    fn unsupported_service_integration_returns_clear_error() {
-        let err = require_service_integration_for(partial_profile(), "dns-serve --apply-resolver")
-            .expect_err("unsupported profile should return an error");
-        let text = format!("{}", err);
-        assert!(text.contains("dns-serve --apply-resolver"));
-        assert!(text.contains("service integration is only supported on linux"));
     }
 
     #[test]

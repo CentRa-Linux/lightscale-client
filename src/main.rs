@@ -1299,6 +1299,9 @@ async fn main() -> Result<()> {
             probe_timeout,
         } => {
             platform::require_data_plane("wg-up")?;
+            if *apply_routes {
+                data_plane::require_advertised_routes(data_plane.as_ref(), "wg-up --apply-routes")?;
+            }
             let config = load_optional_config(&args)?;
             let control_urls = resolve_control_urls(&args, config.as_ref())?;
             let tls_pin = resolve_tls_pin(&args, &config);
@@ -1415,6 +1418,9 @@ async fn main() -> Result<()> {
             pid_file,
         } => {
             platform::require_data_plane("agent")?;
+            if *apply_routes {
+                data_plane::require_advertised_routes(data_plane.as_ref(), "agent --apply-routes")?;
+            }
             if *heartbeat_interval == 0 {
                 return Err(anyhow!("heartbeat_interval must be > 0"));
             }
@@ -1430,6 +1436,19 @@ async fn main() -> Result<()> {
             if *relay_reprobe_after == 0 {
                 return Err(anyhow!("relay_reprobe_after must be > 0"));
             }
+            let resolver_integration_enabled = if *dns_apply_resolver {
+                match data_plane.capabilities().dns_resolver_integration {
+                    platform::SupportLevel::Unsupported => {
+                        eprintln!(
+                            "dns resolver integration requested but unsupported on this platform; continuing without resolver apply"
+                        );
+                        false
+                    }
+                    _ => true,
+                }
+            } else {
+                false
+            };
 
             // PID file check for single-instance enforcement.
             // Keep the guard alive for the full agent lifetime.
@@ -1580,7 +1599,7 @@ async fn main() -> Result<()> {
                     ensure_netmap(&control_urls, tls_pin.clone(), &mut state, &state_path).await?;
                 dns_state = Some(data_plane.dns_spawn(listen_addr, netmap.clone())?);
                 dns_listen_addr = Some(listen_addr);
-                if *dns_apply_resolver {
+                if resolver_integration_enabled {
                     if listen_addr.port() != 53 {
                         eprintln!("dns listen port must be 53 to apply resolver");
                     } else if let Err(err) = data_plane.dns_apply_resolver(
@@ -1682,7 +1701,7 @@ async fn main() -> Result<()> {
                                     *guard = netmap.clone();
                                 }
                             }
-                            if *dns_apply_resolver {
+                            if resolver_integration_enabled {
                                 if let Some(listen_addr) = dns_listen_addr.as_ref() {
                                     if listen_addr.port() == 53 {
                                         if let Err(err) = data_plane.dns_apply_resolver(
@@ -1798,7 +1817,7 @@ async fn main() -> Result<()> {
                 }
             }
 
-            if *dns_apply_resolver {
+            if resolver_integration_enabled {
                 if let Err(err) = data_plane.dns_clear_resolver(&iface) {
                     eprintln!("failed to clear dns resolver: {}", err);
                 }
@@ -1814,11 +1833,11 @@ async fn main() -> Result<()> {
             profiles,
             agent_arg,
         } => {
-            platform::require_linux_data_plane("daemon")?;
+            data_plane::require_daemon_supervision(data_plane.as_ref(), "daemon")?;
             run_daemon(&args, profiles, agent_arg).await?;
         }
         Command::Router { command } => {
-            platform::require_linux_data_plane("router")?;
+            data_plane::require_router_mode(data_plane.as_ref(), "router")?;
             match command {
                 RouterCommand::Enable {
                     interface,
@@ -1994,6 +2013,10 @@ async fn main() -> Result<()> {
         }
         Command::Platform { json } => {
             let profile = platform::current();
+            let data_plane_caps = data_plane.capabilities();
+            let service_manager = data_plane.service_manager();
+            let daemon_supervision = service_manager.daemon_supervision();
+            let os_service_integration = service_manager.os_service_integration();
             if *json {
                 let payload = serde_json::json!({
                     "os": profile.os,
@@ -2003,6 +2026,17 @@ async fn main() -> Result<()> {
                     "service_integration": profile.service_integration.as_str(),
                     "service_managers": profile.service_managers,
                     "note": profile.note,
+                    "data_plane_capabilities": {
+                        "wireguard": data_plane_caps.wireguard.as_str(),
+                        "advertised_routes": data_plane_caps.advertised_routes.as_str(),
+                        "advanced_route_policy": data_plane_caps.advanced_route_policy.as_str(),
+                        "router_mode": data_plane_caps.router_mode.as_str(),
+                        "dns_local_server": data_plane_caps.dns_local_server.as_str(),
+                        "dns_resolver_integration": data_plane_caps.dns_resolver_integration.as_str(),
+                        "daemon_supervision": daemon_supervision.as_str(),
+                        "os_service_integration": os_service_integration.as_str(),
+                        "note": data_plane_caps.note,
+                    },
                 });
                 println!("{}", serde_json::to_string_pretty(&payload)?);
             } else {
@@ -2015,6 +2049,33 @@ async fn main() -> Result<()> {
                 );
                 println!("service_managers: {}", profile.service_managers.join(", "));
                 println!("note: {}", profile.note);
+                println!("feature.wireguard: {}", data_plane_caps.wireguard.as_str());
+                println!(
+                    "feature.advertised_routes: {}",
+                    data_plane_caps.advertised_routes.as_str()
+                );
+                println!(
+                    "feature.advanced_route_policy: {}",
+                    data_plane_caps.advanced_route_policy.as_str()
+                );
+                println!("feature.router_mode: {}", data_plane_caps.router_mode.as_str());
+                println!(
+                    "feature.dns_local_server: {}",
+                    data_plane_caps.dns_local_server.as_str()
+                );
+                println!(
+                    "feature.dns_resolver_integration: {}",
+                    data_plane_caps.dns_resolver_integration.as_str()
+                );
+                println!(
+                    "feature.daemon_supervision: {}",
+                    daemon_supervision.as_str()
+                );
+                println!(
+                    "feature.os_service_integration: {}",
+                    os_service_integration.as_str()
+                );
+                println!("feature.note: {}", data_plane_caps.note);
             }
         }
         Command::Dns {
@@ -2084,7 +2145,10 @@ async fn main() -> Result<()> {
             let listen_addr: SocketAddr = listen.parse().context("invalid listen address")?;
             let _state = data_plane.dns_spawn(listen_addr, netmap.clone())?;
             if *apply_resolver {
-                platform::require_linux_service_integration("dns-serve --apply-resolver")?;
+                data_plane::require_dns_resolver_integration(
+                    data_plane.as_ref(),
+                    "dns-serve --apply-resolver",
+                )?;
                 if listen_addr.port() != 53 {
                     return Err(anyhow!("dns listen port must be 53 to apply resolver"));
                 }

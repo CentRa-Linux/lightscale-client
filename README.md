@@ -182,7 +182,8 @@ JSON output (for automation/CI checks):
 cargo run -- platform --json
 ```
 
-`status --wg`, `daemon`, and `router` are Linux-only.
+`status --wg` and `router` are Linux-only.
+`daemon` is available where data-plane support exists; OS-native service integration remains Linux-first.
 `wg-up`, `wg-down`, and `agent` use the cross-platform data-plane abstraction:
 - Linux: native netlink + nftables path (primary supported path)
 - macOS: experimental userspace WireGuard path
@@ -195,6 +196,8 @@ cargo run -- platform --json
 ```
 
 and verify `"data_plane"` support before running `wg-up`/`agent`.
+For detailed feature gates (routes/resolver/daemon/service), check
+`"data_plane_capabilities"` in the same JSON output.
 
 Official support tiers (Linux full client, desktop control-plane tier, mobile
 integration contract) are documented in `../docs/platform-support.md`.
