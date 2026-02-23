@@ -202,10 +202,7 @@ fn build_allocate_request(
 ) -> ([u8; 12], Vec<u8>) {
     let transaction_id = random_transaction_id();
     let mut attrs = Vec::new();
-    attrs.push(Attribute::new(
-        ATTR_REQUESTED_TRANSPORT,
-        vec![17, 0, 0, 0],
-    ));
+    attrs.push(Attribute::new(ATTR_REQUESTED_TRANSPORT, vec![17, 0, 0, 0]));
     if let Some(username) = username {
         attrs.push(Attribute::new(ATTR_USERNAME, username.as_bytes().to_vec()));
     }

@@ -41,8 +41,10 @@ pub async fn apply_advertised_routes(netmap: &NetMap, cfg: &RouteApplyConfig) ->
         .ok_or_else(|| anyhow!("interface {} not found", cfg.interface))?;
     let existing_routes = netlink.list_routes().await?;
     let selected_exit_peers = select_exit_peers(netmap, cfg);
-    let selected_exit_ids: HashSet<String> =
-        selected_exit_peers.iter().map(|peer| peer.peer_id.clone()).collect();
+    let selected_exit_ids: HashSet<String> = selected_exit_peers
+        .iter()
+        .map(|peer| peer.peer_id.clone())
+        .collect();
     let selected_exit_metrics: HashMap<String, u32> = selected_exit_peers
         .iter()
         .filter_map(|peer| peer.metric.map(|metric| (peer.peer_id.clone(), metric)))
@@ -198,9 +200,7 @@ pub async fn apply_advertised_routes(netmap: &NetMap, cfg: &RouteApplyConfig) ->
         );
     }
     if skipped_exit {
-        eprintln!(
-            "exit node selection active; routes from other exit nodes were skipped"
-        );
+        eprintln!("exit node selection active; routes from other exit nodes were skipped");
     }
 
     Ok(())
@@ -221,10 +221,7 @@ pub fn selected_exit_peer_ids(netmap: &NetMap, cfg: &RouteApplyConfig) -> HashSe
     if !allow_exit_routes {
         return HashSet::new();
     }
-    selected
-        .into_iter()
-        .map(|peer| peer.peer_id)
-        .collect()
+    selected.into_iter().map(|peer| peer.peer_id).collect()
 }
 
 fn route_apply_prefix(route: &Route) -> Result<&str> {
@@ -268,10 +265,12 @@ fn select_exit_peers(netmap: &NetMap, cfg: &RouteApplyConfig) -> Vec<ExitPeerSel
         return candidates
             .into_iter()
             .find(|peer| &peer.id == id)
-            .map(|peer| vec![ExitPeerSelection {
-                peer_id: peer.id.clone(),
-                metric: None,
-            }])
+            .map(|peer| {
+                vec![ExitPeerSelection {
+                    peer_id: peer.id.clone(),
+                    metric: None,
+                }]
+            })
             .unwrap_or_default();
     }
 
@@ -279,10 +278,12 @@ fn select_exit_peers(netmap: &NetMap, cfg: &RouteApplyConfig) -> Vec<ExitPeerSel
         return candidates
             .into_iter()
             .find(|peer| peer.name == *name)
-            .map(|peer| vec![ExitPeerSelection {
-                peer_id: peer.id.clone(),
-                metric: None,
-            }])
+            .map(|peer| {
+                vec![ExitPeerSelection {
+                    peer_id: peer.id.clone(),
+                    metric: None,
+                }]
+            })
             .unwrap_or_default();
     }
 

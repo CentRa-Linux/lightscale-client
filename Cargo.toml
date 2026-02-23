@@ -26,10 +26,14 @@ sha2 = "0.10"
 sha1 = "0.10"
 socket2 = "0.5"
 time = { version = "0.3", features = ["serde", "formatting"] }
-tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "signal"] }
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "signal"] }
 tokio-rustls = "0.26"
 url = "2"
 webpki-roots = "0.26"
 wireguard-control = "1.7"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 netlink-packet-route = "0.28"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nftnl = "0.9"
+mnl = "0.2"

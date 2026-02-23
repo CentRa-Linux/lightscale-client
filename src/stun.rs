@@ -9,7 +9,11 @@ const BINDING_SUCCESS: u16 = 0x0101;
 const ATTR_MAPPED_ADDRESS: u16 = 0x0001;
 const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
 
-pub fn discover_endpoint(servers: &[String], bind_port: u16, timeout: Duration) -> Result<SocketAddr> {
+pub fn discover_endpoint(
+    servers: &[String],
+    bind_port: u16,
+    timeout: Duration,
+) -> Result<SocketAddr> {
     let mut last_err: Option<anyhow::Error> = None;
     for server in servers {
         match discover_endpoint_one(server, bind_port, timeout) {

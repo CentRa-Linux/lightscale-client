@@ -14,7 +14,9 @@ mod imp {
         rule::{RuleAttribute, RuleUidRange},
         AddressFamily,
     };
-    use rtnetlink::{new_connection, Handle, LinkUnspec, RouteMessageBuilder};
+    use rtnetlink::{
+        new_connection, AddressMessageBuilder, Handle, LinkUnspec, RouteMessageBuilder,
+    };
     use std::time::Instant;
     use tokio::time::sleep;
 
@@ -32,7 +34,6 @@ mod imp {
     #[derive(Debug, Clone)]
     pub struct InterfaceAddress {
         pub addr: IpAddr,
-        #[allow(dead_code)]
         pub prefix: u8,
     }
 
@@ -123,18 +124,51 @@ mod imp {
             Ok(results)
         }
 
-        pub async fn replace_address(
-            &self,
-            index: u32,
-            address: IpAddr,
-            prefix: u8,
-        ) -> Result<()> {
-            self.handle
-                .address()
-                .add(index, address, prefix)
-                .replace()
-                .execute()
-                .await?;
+        pub async fn replace_address(&self, index: u32, address: IpAddr, prefix: u8) -> Result<()> {
+            if let (IpAddr::V4(v4), 32) = (address, prefix) {
+                // Ensure old addr attrs (notably broadcast) do not survive
+                // replace operations on /32 WireGuard addresses.
+                let del_msg = AddressMessageBuilder::<Ipv4Addr>::new()
+                    .index(index)
+                    .address(v4, prefix)
+                    .build();
+                let _ = self.handle.address().del(del_msg).execute().await;
+            }
+
+            let mut req = self.handle.address().add(index, address, prefix).replace();
+            if let (IpAddr::V4(_), 32) = (address, prefix) {
+                // rtnetlink's builder always sets IFA_BROADCAST for IPv4,
+                // including /32 addresses where it equals the host address.
+                // On WireGuard /32 this can cause ICMP echo to be treated as
+                // broadcast and ignored.
+                req.message_mut().attributes.retain(|attr| {
+                    !matches!(
+                        attr,
+                        AddressAttribute::Broadcast(_) | AddressAttribute::Address(_)
+                    )
+                });
+            }
+            req.execute().await?;
+            Ok(())
+        }
+
+        pub async fn delete_address(&self, index: u32, address: IpAddr, prefix: u8) -> Result<()> {
+            match address {
+                IpAddr::V4(v4) => {
+                    let msg = AddressMessageBuilder::<Ipv4Addr>::new()
+                        .index(index)
+                        .address(v4, prefix)
+                        .build();
+                    self.handle.address().del(msg).execute().await?;
+                }
+                IpAddr::V6(v6) => {
+                    let msg = AddressMessageBuilder::<Ipv6Addr>::new()
+                        .index(index)
+                        .address(v6, prefix)
+                        .build();
+                    self.handle.address().del(msg).execute().await?;
+                }
+            }
             Ok(())
         }
 
@@ -299,6 +333,20 @@ mod imp {
             Ok(())
         }
 
+        pub async fn list_link_names(&self) -> Result<Vec<String>> {
+            let mut links = self.handle.link().get().execute();
+            let mut names = Vec::new();
+            while let Some(link) = links.try_next().await? {
+                for attr in link.attributes {
+                    if let LinkAttribute::IfName(name) = attr {
+                        names.push(name);
+                        break;
+                    }
+                }
+            }
+            Ok(names)
+        }
+
         pub async fn list_routes(&self) -> Result<Vec<RouteEntry>> {
             let mut entries = Vec::new();
             entries.extend(self.list_routes_v4().await?);
@@ -420,6 +468,15 @@ mod imp {
             Err(anyhow!("netlink is only supported on linux"))
         }
 
+        pub async fn delete_address(
+            &self,
+            _index: u32,
+            _address: IpAddr,
+            _prefix: u8,
+        ) -> Result<()> {
+            Err(anyhow!("netlink is only supported on linux"))
+        }
+
         pub async fn replace_route(&self, _prefix: IpNet, _index: u32) -> Result<()> {
             Err(anyhow!("netlink is only supported on linux"))
         }
@@ -473,6 +530,10 @@ mod imp {
         }
 
         pub async fn delete_link(&self, _name: &str) -> Result<()> {
+            Err(anyhow!("netlink is only supported on linux"))
+        }
+
+        pub async fn list_link_names(&self) -> Result<Vec<String>> {
             Err(anyhow!("netlink is only supported on linux"))
         }
 

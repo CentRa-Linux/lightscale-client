@@ -56,9 +56,7 @@ impl RelayTunnelManager {
             return Ok(tunnel.local_addr);
         }
 
-        let mut relay_ip = self
-            .relay_ip
-            .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let mut relay_ip = self.relay_ip.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
         let socket = match UdpSocket::bind(SocketAddr::new(relay_ip, 0)).await {
             Ok(socket) => socket,
             Err(_) => {
@@ -111,7 +109,10 @@ async fn run_tunnel(
                     sleep(RECONNECT_DELAY).await;
                     continue;
                 }
-                eprintln!("relay tunnel {} connected to {} for {}", node_id, server, peer_id);
+                eprintln!(
+                    "relay tunnel {} connected to {} for {}",
+                    node_id, server, peer_id
+                );
                 let mut saw_send = false;
                 let mut saw_recv = false;
                 loop {

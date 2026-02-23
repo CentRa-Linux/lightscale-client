@@ -45,6 +45,10 @@ pub fn apply_resolver(interface: &str, domain: &str, server: IpAddr) -> Result<(
     Ok(())
 }
 
+pub fn clear_resolver(interface: &str) -> Result<()> {
+    run_resolvectl(&["revert", interface])
+}
+
 fn run_resolvectl(args: &[&str]) -> Result<()> {
     let output = std::process::Command::new("resolvectl").args(args).output();
     let output = match output {
@@ -73,8 +77,7 @@ fn build_response(request: &Message, state: &Arc<Mutex<NetMap>>) -> Result<Messa
     for query in request.queries() {
         response.add_query(query.clone());
         let name = normalize_name(&query.name().to_ascii());
-        let within_domain =
-            name == domain || name.ends_with(&format!(".{}", domain));
+        let within_domain = name == domain || name.ends_with(&format!(".{}", domain));
         if within_domain {
             any_within_domain = true;
         }
@@ -134,10 +137,7 @@ fn lookup_name(netmap: &NetMap, name: &str) -> Option<Vec<IpAddr>> {
     for peer in &netmap.peers {
         let peer_name = normalize_name(&peer.dns_name);
         if name == peer_name {
-            return Some(vec![
-                peer.ipv4.parse().ok()?,
-                peer.ipv6.parse().ok()?,
-            ]);
+            return Some(vec![peer.ipv4.parse().ok()?, peer.ipv6.parse().ok()?]);
         }
     }
     None

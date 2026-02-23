@@ -105,7 +105,8 @@ pub async fn interface_ips(out_interface: &str) -> Result<(Option<String>, Optio
 async fn default_out_interface() -> Result<String> {
     let netlink = Netlink::new().await?;
     let routes = netlink.list_routes().await?;
-    let index = find_default_oif(&routes).ok_or_else(|| anyhow!("failed to detect default route interface"))?;
+    let index = find_default_oif(&routes)
+        .ok_or_else(|| anyhow!("failed to detect default route interface"))?;
     let name = netlink
         .link_name(index)
         .await?
@@ -139,8 +140,7 @@ fn write_sysctl(path: &str, value: &str) -> Result<()> {
     if let Some(parent) = Path::new(path).parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    std::fs::write(path, value)
-        .with_context(|| format!("failed to write sysctl {}", path))?;
+    std::fs::write(path, value).with_context(|| format!("failed to write sysctl {}", path))?;
     Ok(())
 }
 

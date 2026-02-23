@@ -58,11 +58,7 @@ impl ControlClient {
             match response {
                 Ok(resp) => {
                     if resp.status().is_server_error() {
-                        last_err = Some(anyhow!(
-                            "control {} returned {}",
-                            base,
-                            resp.status()
-                        ));
+                        last_err = Some(anyhow!("control {} returned {}", base, resp.status()));
                         continue;
                     }
                     self.next_index.store(index, Ordering::Relaxed);
@@ -73,10 +69,7 @@ impl ControlClient {
                         last_err = Some(anyhow!("control {} request failed: {}", base, err));
                         continue;
                     }
-                    return Err(anyhow!(err).context(format!(
-                        "control {} request failed",
-                        base
-                    )));
+                    return Err(anyhow!(err).context(format!("control {} request failed", base)));
                 }
             }
         }
@@ -87,10 +80,6 @@ impl ControlClient {
     fn endpoint_at(base: &str, path: &str) -> String {
         let base = base.trim_end_matches('/');
         format!("{}{}", base, path)
-    }
-
-    fn node_auth(&self) -> Option<&str> {
-        self.node_token.as_deref()
     }
 
     fn admin_auth(&self) -> Option<&str> {
@@ -126,6 +115,22 @@ impl ControlClient {
             .await?
             .error_for_status()
             .context("register-url request failed")?;
+        Ok(response.json().await?)
+    }
+
+    pub async fn approve_with_auth_path(&self, auth_path: &str) -> Result<ApproveNodeResponse> {
+        let normalized_path = if auth_path.starts_with('/') {
+            auth_path.to_string()
+        } else {
+            format!("/{}", auth_path)
+        };
+        let response = self
+            .send_with_failover(|client, base| {
+                client.get(Self::endpoint_at(base, &normalized_path))
+            })
+            .await?
+            .error_for_status()
+            .context("approve auth-url request failed")?;
         Ok(response.json().await?)
     }
 
@@ -414,10 +419,7 @@ impl ControlClient {
         let response = self
             .send_with_failover(|client, base| {
                 with_bearer(
-                    client.get(Self::endpoint_at(
-                        base,
-                        &format!("/v1/netmap/{}", node_id),
-                    )),
+                    client.get(Self::endpoint_at(base, &format!("/v1/netmap/{}", node_id))),
                     self.node_or_admin_auth(),
                 )
             })
@@ -473,10 +475,7 @@ fn should_retry(err: &reqwest::Error) -> bool {
     err.is_connect() || err.is_timeout() || err.is_request()
 }
 
-fn with_bearer(
-    request: reqwest::RequestBuilder,
-    token: Option<&str>,
-) -> reqwest::RequestBuilder {
+fn with_bearer(request: reqwest::RequestBuilder, token: Option<&str>) -> reqwest::RequestBuilder {
     if let Some(token) = token {
         request.bearer_auth(token)
     } else {
@@ -499,9 +498,13 @@ impl ServerCertVerifier for PinnedServerCertVerifier {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        let verified = self
-            .inner
-            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)?;
+        let verified = self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        )?;
         let mut hasher = Sha256::new();
         hasher.update(end_entity.as_ref());
         let digest = hasher.finalize();

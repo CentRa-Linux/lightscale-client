@@ -39,6 +39,7 @@ struct PeerEndpointState {
     next_index: usize,
     rotations: usize,
     relay_active: bool,
+    last_direct_probe_at: Option<Instant>,
 }
 
 pub async fn apply(
@@ -56,7 +57,24 @@ pub async fn apply(
     Ok(())
 }
 
+/// Lightscale interface prefix for identification.
+pub const INTERFACE_PREFIX: &str = "ls-";
+
+/// Checks if an interface name is managed by lightscale.
+pub fn is_lightscale_interface(name: &str) -> bool {
+    name.starts_with(INTERFACE_PREFIX)
+}
+
 pub async fn remove(interface: &str, backend: Backend) -> Result<()> {
+    // Safety check: only remove interfaces managed by lightscale
+    if !is_lightscale_interface(interface) {
+        return Err(anyhow!(
+            "refusing to remove non-lightscale interface '{}': must start with '{}'",
+            interface,
+            INTERFACE_PREFIX
+        ));
+    }
+    
     let netlink = Netlink::new().await?;
     match backend {
         Backend::Kernel => {
@@ -84,7 +102,10 @@ pub fn probe_peers(netmap: &NetMap, timeout_seconds: u64) -> Result<()> {
                     probed = true;
                 }
                 Err(_) => {
-                    eprintln!("probe skipped invalid endpoint {} for {}", endpoint, peer.id);
+                    eprintln!(
+                        "probe skipped invalid endpoint {} for {}",
+                        endpoint, peer.id
+                    );
                 }
             }
         }
@@ -110,11 +131,9 @@ pub fn refresh_peer_endpoints(
     relay_endpoints: &HashMap<String, SocketAddr>,
     stale_after: Duration,
     max_rotations: usize,
+    relay_reprobe_after: Duration,
 ) -> Result<()> {
-    let iface: InterfaceName = cfg
-        .interface
-        .parse()
-        .context("invalid interface name")?;
+    let iface: InterfaceName = cfg.interface.parse().context("invalid interface name")?;
     let backend = backend_for(cfg.backend);
     let device = Device::get(&iface, backend).context("wireguard device query failed")?;
 
@@ -124,7 +143,6 @@ pub fn refresh_peer_endpoints(
     }
 
     let max_rotations = max_rotations.max(1);
-    let mut update = DeviceUpdate::new();
     let mut changed = false;
     let mut desired_endpoints: HashMap<String, SocketAddr> = HashMap::new();
 
@@ -139,82 +157,132 @@ pub fn refresh_peer_endpoints(
             Some(ts) => ts.elapsed().map(|age| age > stale_after).unwrap_or(true),
             None => true,
         };
+        let state = tracker.peers.entry(peer.id.clone()).or_default();
+        let relay_active_before = state.relay_active;
+        let current_endpoint = info.and_then(|info| info.config.endpoint);
+        let relay_endpoint = relay_endpoints.get(&peer.id).copied();
+        let current_is_relay = relay_endpoint
+            .map(|relay| Some(relay) == current_endpoint)
+            .unwrap_or(false);
+
         if !handshake_stale {
-            let state = tracker.peers.entry(peer.id.clone()).or_default();
             state.rotations = 0;
-            state.relay_active = false;
+            if current_is_relay && !endpoints.is_empty() {
+                let should_probe = state
+                    .last_direct_probe_at
+                    .map(|ts| ts.elapsed() >= relay_reprobe_after)
+                    .unwrap_or(true);
+                if should_probe {
+                    let idx = state.next_index % endpoints.len();
+                    let desired = endpoints[idx];
+                    state.next_index = (idx + 1) % endpoints.len();
+                    state.last_direct_probe_at = Some(Instant::now());
+                    state.relay_active = false;
+                    eprintln!(
+                        "endpoint refresh peer={} reprobe direct endpoint {} (current={} relay={})",
+                        peer.id,
+                        desired,
+                        format_opt_endpoint(current_endpoint),
+                        format_opt_endpoint(relay_endpoint),
+                    );
+                    if Some(desired) != current_endpoint {
+                        changed = true;
+                        desired_endpoints.insert(peer.id.clone(), desired);
+                    }
+                    continue;
+                }
+                state.relay_active = true;
+            } else {
+                state.relay_active = false;
+            }
             continue;
         }
 
-        let state = tracker.peers.entry(peer.id.clone()).or_default();
-        let current_endpoint = info.and_then(|info| info.config.endpoint);
         let mut desired_endpoint = None;
 
         if state.relay_active {
-            if let Some(relay) = relay_endpoints.get(&peer.id) {
-                desired_endpoint = Some(*relay);
+            if let Some(relay) = relay_endpoint {
+                desired_endpoint = Some(relay);
+            } else if !endpoints.is_empty() {
+                let idx = state.next_index % endpoints.len();
+                desired_endpoint = Some(endpoints[idx]);
+                state.next_index = (idx + 1) % endpoints.len();
+                state.relay_active = false;
             }
         } else if !endpoints.is_empty() {
             let idx = state.next_index % endpoints.len();
             desired_endpoint = Some(endpoints[idx]);
             state.next_index = (idx + 1) % endpoints.len();
             state.rotations = state.rotations.saturating_add(1);
-            if state.rotations >= max_rotations && relay_endpoints.contains_key(&peer.id) {
+            if state.rotations >= max_rotations && relay_endpoint.is_some() {
+                eprintln!(
+                    "endpoint refresh peer={} enabling relay fallback after {} rotation(s)",
+                    peer.id, state.rotations
+                );
                 state.relay_active = true;
                 state.rotations = 0;
+                state.last_direct_probe_at = Some(Instant::now());
             }
-        } else if let Some(relay) = relay_endpoints.get(&peer.id) {
+        } else if let Some(relay) = relay_endpoint {
+            eprintln!(
+                "endpoint refresh peer={} using relay endpoint {} (no direct endpoints available)",
+                peer.id, relay
+            );
             state.relay_active = true;
             state.rotations = 0;
-            desired_endpoint = Some(*relay);
+            state.last_direct_probe_at = Some(Instant::now());
+            desired_endpoint = Some(relay);
+        }
+
+        if relay_active_before != state.relay_active {
+            eprintln!(
+                "endpoint refresh peer={} relay_active {} -> {}",
+                peer.id, relay_active_before, state.relay_active
+            );
         }
 
         if let Some(desired) = desired_endpoint {
             if Some(desired) != current_endpoint {
+                eprintln!(
+                    "endpoint refresh peer={} update {} -> {}",
+                    peer.id,
+                    format_opt_endpoint(current_endpoint),
+                    desired
+                );
                 changed = true;
-                if backend == WgBackend::Userspace {
-                    desired_endpoints.insert(peer.id.clone(), desired);
-                } else {
-                    let peer_key = Key::from_base64(&peer.wg_public_key)
-                        .with_context(|| format!("invalid peer public key {}", peer.id))?;
-                    update = update.add_peer(
-                        PeerConfigBuilder::new(&peer_key)
-                            .set_endpoint(desired)
-                            .set_persistent_keepalive_interval(25),
-                    );
-                }
+                desired_endpoints.insert(peer.id.clone(), desired);
             }
         }
     }
 
     if changed {
-        if backend == WgBackend::Userspace {
-            let mut full_update = DeviceUpdate::new().replace_peers();
-            for peer in &netmap.peers {
-                let info = peer_info.get(&peer.wg_public_key);
-                let mut builder = if let Some(info) = info {
-                    PeerConfigBuilder::from_peer_config(info.config.clone())
-                } else {
-                    build_peer_builder_from_netmap(peer)?
-                };
-                if let Some(desired) = desired_endpoints.get(&peer.id) {
-                    builder = builder
-                        .set_endpoint(*desired)
-                        .set_persistent_keepalive_interval(25);
-                }
-                full_update = full_update.add_peer(builder);
+        let mut full_update = DeviceUpdate::new().replace_peers();
+        for peer in &netmap.peers {
+            let info = peer_info.get(&peer.wg_public_key);
+            let mut builder = if let Some(info) = info {
+                PeerConfigBuilder::from_peer_config(info.config.clone())
+            } else {
+                build_peer_builder_from_netmap(peer)?
+            };
+            if let Some(desired) = desired_endpoints.get(&peer.id) {
+                builder = builder
+                    .set_endpoint(*desired)
+                    .set_persistent_keepalive_interval(25);
             }
-            full_update
-                .apply(&iface, backend)
-                .context("wireguard endpoint refresh failed")?;
-        } else {
-            update
-                .apply(&iface, backend)
-                .context("wireguard endpoint refresh failed")?;
+            full_update = full_update.add_peer(builder);
         }
+        full_update
+            .apply(&iface, backend)
+            .context("wireguard endpoint refresh failed")?;
     }
 
     Ok(())
+}
+
+fn format_opt_endpoint(endpoint: Option<SocketAddr>) -> String {
+    endpoint
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".to_string())
 }
 
 async fn apply_kernel(
@@ -251,15 +319,40 @@ async fn apply_boringtun(
     Ok(index)
 }
 
-async fn configure_addresses(
+async fn configure_addresses(netlink: &Netlink, index: u32, state: &ClientState) -> Result<()> {
+    let ipv4 = parse_ip(&state.ipv4, "ipv4")?;
+    let ipv6 = parse_ip(&state.ipv6, "ipv6")?;
+    reconcile_interface_addresses(netlink, index, ipv4, ipv6).await?;
+    netlink.replace_address(index, ipv4, 32).await?;
+    netlink.replace_address(index, ipv6, 128).await?;
+    Ok(())
+}
+
+async fn reconcile_interface_addresses(
     netlink: &Netlink,
     index: u32,
-    state: &ClientState,
+    desired_ipv4: IpAddr,
+    desired_ipv6: IpAddr,
 ) -> Result<()> {
-    let ipv4 = parse_ip(&state.ipv4, "ipv4")?;
-    netlink.replace_address(index, ipv4, 32).await?;
-    let ipv6 = parse_ip(&state.ipv6, "ipv6")?;
-    netlink.replace_address(index, ipv6, 128).await?;
+    let current = netlink.interface_addresses(index).await?;
+    for entry in current {
+        let keep = match entry.addr {
+            IpAddr::V4(_) => entry.addr == desired_ipv4 && entry.prefix == 32,
+            IpAddr::V6(_) => entry.addr == desired_ipv6 && entry.prefix == 128,
+        };
+        if keep {
+            continue;
+        }
+        if let Err(err) = netlink
+            .delete_address(index, entry.addr, entry.prefix)
+            .await
+        {
+            eprintln!(
+                "address cleanup skipped for {} /{}: {}",
+                entry.addr, entry.prefix, err
+            );
+        }
+    }
     Ok(())
 }
 
@@ -270,10 +363,7 @@ fn apply_wireguard_config(
     routes_cfg: Option<&routes::RouteApplyConfig>,
     backend: WgBackend,
 ) -> Result<()> {
-    let iface: InterfaceName = cfg
-        .interface
-        .parse()
-        .context("invalid interface name")?;
+    let iface: InterfaceName = cfg.interface.parse().context("invalid interface name")?;
     let update = build_device_update(netmap, state, cfg, routes_cfg)?;
     update
         .apply(&iface, backend)
@@ -287,8 +377,8 @@ fn build_device_update(
     cfg: &WgConfig,
     routes_cfg: Option<&routes::RouteApplyConfig>,
 ) -> Result<DeviceUpdate> {
-    let private_key = Key::from_base64(&state.wg_private_key)
-        .context("invalid wireguard private key")?;
+    let private_key =
+        Key::from_base64(&state.wg_private_key).context("invalid wireguard private key")?;
     let mut update = DeviceUpdate::new()
         .set_private_key(private_key)
         .set_listen_port(cfg.listen_port)
@@ -298,8 +388,7 @@ fn build_device_update(
         .unwrap_or_default();
 
     for peer in &netmap.peers {
-        let peer_key =
-            Key::from_base64(&peer.wg_public_key).context("invalid peer public key")?;
+        let peer_key = Key::from_base64(&peer.wg_public_key).context("invalid peer public key")?;
         let ipv4: IpAddr = peer.ipv4.parse().context("invalid peer ipv4")?;
         let ipv6: IpAddr = peer.ipv6.parse().context("invalid peer ipv6")?;
         let mut allowed: HashSet<IpNet> = HashSet::new();
@@ -449,7 +538,10 @@ async fn wait_for_userspace_socket(interface: &str, timeout: Duration) -> Result
             return Ok(());
         }
         if start.elapsed() > timeout {
-            return Err(anyhow!("userspace wg socket {} did not appear", path.display()));
+            return Err(anyhow!(
+                "userspace wg socket {} did not appear",
+                path.display()
+            ));
         }
         sleep(Duration::from_millis(100)).await;
     }
@@ -460,7 +552,9 @@ fn userspace_socket_path(interface: &str) -> PathBuf {
 }
 
 fn parse_ip(address: &str, label: &str) -> Result<IpAddr> {
-    let ip: IpAddr = address.parse().with_context(|| format!("invalid {}", label))?;
+    let ip: IpAddr = address
+        .parse()
+        .with_context(|| format!("invalid {}", label))?;
     match (label, ip) {
         ("ipv4", IpAddr::V4(_)) => Ok(ip),
         ("ipv6", IpAddr::V6(_)) => Ok(ip),
@@ -496,7 +590,8 @@ fn probe_addr(
             if v4_socket.is_none() {
                 match std::net::UdpSocket::bind("0.0.0.0:0") {
                     Ok(sock) => {
-                        let _ = sock.set_write_timeout(Some(Duration::from_secs(timeout_seconds.max(1))));
+                        let _ = sock
+                            .set_write_timeout(Some(Duration::from_secs(timeout_seconds.max(1))));
                         *v4_socket = Some(sock);
                     }
                     Err(_) => {
@@ -511,7 +606,8 @@ fn probe_addr(
             if v6_socket.is_none() {
                 match std::net::UdpSocket::bind("[::]:0") {
                     Ok(sock) => {
-                        let _ = sock.set_write_timeout(Some(Duration::from_secs(timeout_seconds.max(1))));
+                        let _ = sock
+                            .set_write_timeout(Some(Duration::from_secs(timeout_seconds.max(1))));
                         *v6_socket = Some(sock);
                     }
                     Err(_) => {

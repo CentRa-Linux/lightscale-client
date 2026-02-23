@@ -6,6 +6,7 @@ mod keys;
 mod l2_relay;
 mod model;
 mod netlink;
+mod platform;
 mod relay_tunnel;
 mod resource_guard;
 mod router;
@@ -27,6 +28,7 @@ use sha2::{Digest, Sha256};
 use state::{default_state_dir, load_state, save_state, state_path, ClientState};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -76,13 +78,27 @@ enum Command {
         token: String,
         #[arg(long)]
         node_name: Option<String>,
+        #[arg(long, value_name = "PATH")]
+        machine_private_key_file: Option<PathBuf>,
+        #[arg(long, value_name = "PATH")]
+        wg_private_key_file: Option<PathBuf>,
     },
     RegisterUrl {
         network_id: String,
         #[arg(long)]
         node_name: Option<String>,
+        #[arg(long, value_name = "PATH")]
+        machine_private_key_file: Option<PathBuf>,
+        #[arg(long, value_name = "PATH")]
+        wg_private_key_file: Option<PathBuf>,
         #[arg(long)]
         ttl_seconds: Option<u64>,
+        #[arg(long)]
+        admin_url: Option<String>,
+        #[arg(long)]
+        admin_auto_approve: bool,
+        #[arg(long)]
+        approve: bool,
     },
     Admin {
         #[command(subcommand)]
@@ -263,6 +279,10 @@ enum Command {
     RelayTurn {
         #[command(subcommand)]
         command: RelayTurnCommand,
+    },
+    Platform {
+        #[arg(long)]
+        json: bool,
     },
     Dns {
         #[arg(long, value_enum, default_value = "hosts")]
@@ -557,7 +577,12 @@ async fn main() -> Result<()> {
             save_config(&config_path, &config)?;
             println!("tls pin saved: {}", pin);
         }
-        Command::Register { token, node_name } => {
+        Command::Register {
+            token,
+            node_name,
+            machine_private_key_file,
+            wg_private_key_file,
+        } => {
             let config = load_optional_config(&args)?;
             let control_urls = resolve_control_urls(&args, config.as_ref())?;
             let tls_pin = resolve_tls_pin(&args, &config);
@@ -568,8 +593,8 @@ async fn main() -> Result<()> {
                 return Err(anyhow!("state already exists for profile {}", args.profile));
             }
 
-            let machine_keys = keys::generate_machine_keys();
-            let wg_keys = keys::generate_wg_keys();
+            let machine_keys = resolve_machine_keys(machine_private_key_file.as_ref())?;
+            let wg_keys = resolve_wg_keys(wg_private_key_file.as_ref())?;
             let node_name = node_name.clone().unwrap_or_else(default_node_name);
 
             let client =
@@ -624,7 +649,12 @@ async fn main() -> Result<()> {
         Command::RegisterUrl {
             network_id,
             node_name,
+            machine_private_key_file,
+            wg_private_key_file,
             ttl_seconds,
+            admin_url,
+            admin_auto_approve,
+            approve,
         } => {
             let config = load_optional_config(&args)?;
             let control_urls = resolve_control_urls(&args, config.as_ref())?;
@@ -635,13 +665,20 @@ async fn main() -> Result<()> {
             if load_state(&state_path)?.is_some() {
                 return Err(anyhow!("state already exists for profile {}", args.profile));
             }
+            if *admin_auto_approve && admin_url.is_none() {
+                return Err(anyhow!("--admin-auto-approve requires --admin-url"));
+            }
 
-            let machine_keys = keys::generate_machine_keys();
-            let wg_keys = keys::generate_wg_keys();
+            let machine_keys = resolve_machine_keys(machine_private_key_file.as_ref())?;
+            let wg_keys = resolve_wg_keys(wg_private_key_file.as_ref())?;
             let node_name = node_name.clone().unwrap_or_else(default_node_name);
 
-            let client =
-                ControlClient::new(control_urls.clone(), tls_pin.clone(), None, admin_token)?;
+            let client = ControlClient::new(
+                control_urls.clone(),
+                tls_pin.clone(),
+                None,
+                admin_token.clone(),
+            )?;
             let response = client
                 .register_url(model::RegisterUrlRequest {
                     network_id: network_id.clone(),
@@ -654,7 +691,7 @@ async fn main() -> Result<()> {
                 .context("register-url failed")?;
 
             let now = now_unix();
-            let state = ClientState {
+            let mut state = ClientState {
                 profile: args.profile.clone(),
                 network_id: response.network_id.clone(),
                 node_id: response.node_id.clone(),
@@ -677,13 +714,91 @@ async fn main() -> Result<()> {
                 .map(|base| format!("{}{}", base.trim_end_matches('/'), response.auth_path))
                 .collect();
             println!("registered node {} (pending approval)", response.node_id);
-            if auth_urls.len() == 1 {
+            if let Some(admin_url) = admin_url {
+                let login_approval_url = build_admin_login_approval_url(
+                    admin_url,
+                    &response.network_id,
+                    &response.auth_path,
+                    *admin_auto_approve,
+                )?;
+                if *admin_auto_approve {
+                    println!(
+                        "open this URL to login in lightscale-admin; approval runs automatically after authentication:"
+                    );
+                } else {
+                    println!("open this URL to login and approve in lightscale-admin:");
+                }
+                println!("  {}", login_approval_url);
+                if auth_urls.len() == 1 {
+                    println!("direct control-plane approval URL:");
+                    println!("  {}", auth_urls[0]);
+                } else {
+                    println!("direct control-plane approval URLs (fallback):");
+                    for url in auth_urls {
+                        println!("  {}", url);
+                    }
+                }
+            } else if auth_urls.len() == 1 {
                 println!("open this URL to approve: {}", auth_urls[0]);
             } else {
                 println!("open one of these URLs to approve:");
                 for url in auth_urls {
                     println!("  {}", url);
                 }
+            }
+            if *approve {
+                let approval = client
+                    .approve_with_auth_path(&response.auth_path)
+                    .await
+                    .context("register-url auto-approve failed")?;
+                println!(
+                    "node {} approved={} approved_at={}",
+                    approval.node_id,
+                    approval.approved,
+                    approval
+                        .approved_at
+                        .map(|ts| ts.to_string())
+                        .unwrap_or_else(|| "none".to_string())
+                );
+                let refresh_client = ControlClient::new(
+                    control_urls.clone(),
+                    tls_pin.clone(),
+                    Some(response.node_token.clone()),
+                    admin_token.clone(),
+                )?;
+                let node_id = state.node_id.clone();
+                let mut approved_synced = false;
+                let mut last_netmap_err: Option<anyhow::Error> = None;
+                for _ in 0..20 {
+                    match refresh_client.netmap(&node_id).await {
+                        Ok(netmap) => {
+                            let approved = netmap.node.approved;
+                            state.ipv4 = netmap.node.ipv4.clone();
+                            state.ipv6 = netmap.node.ipv6.clone();
+                            state.last_netmap = Some(netmap);
+                            state.updated_at = now_unix();
+                            save_state(&state_path, &state)?;
+                            if approved {
+                                approved_synced = true;
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            last_netmap_err = Some(err);
+                        }
+                    }
+                    sleep(Duration::from_millis(500)).await;
+                }
+                if !approved_synced {
+                    if let Some(err) = last_netmap_err {
+                        return Err(err).context("approval succeeded but netmap refresh failed");
+                    }
+                    return Err(anyhow!(
+                        "node {} approval not visible in netmap after auto-approve",
+                        state.node_id
+                    ));
+                }
+                println!("local state updated: approved=true");
             }
         }
         Command::Admin { command } => {
@@ -1010,6 +1125,9 @@ async fn main() -> Result<()> {
             interface,
             backend,
         } => {
+            if *wg {
+                platform::require_linux_data_plane("status --wg")?;
+            }
             let state_path = resolve_state_path(&args)?;
             let state = load_state(&state_path)?
                 .ok_or_else(|| anyhow!("state not found for profile {}", args.profile))?;
@@ -1163,6 +1281,7 @@ async fn main() -> Result<()> {
             probe_peers,
             probe_timeout,
         } => {
+            platform::require_linux_data_plane("wg-up")?;
             let config = load_optional_config(&args)?;
             let control_urls = resolve_control_urls(&args, config.as_ref())?;
             let tls_pin = resolve_tls_pin(&args, &config);
@@ -1229,6 +1348,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::WgDown { interface, backend } => {
+            platform::require_linux_data_plane("wg-down")?;
             let iface = interface
                 .clone()
                 .unwrap_or_else(|| default_interface_name(&args.profile));
@@ -1274,6 +1394,7 @@ async fn main() -> Result<()> {
             cleanup_before_start,
             pid_file,
         } => {
+            platform::require_linux_data_plane("agent")?;
             if *heartbeat_interval == 0 {
                 return Err(anyhow!("heartbeat_interval must be > 0"));
             }
@@ -1290,12 +1411,13 @@ async fn main() -> Result<()> {
                 return Err(anyhow!("relay_reprobe_after must be > 0"));
             }
 
-            // PID file check for single-instance enforcement
-            if let Some(pid_path) = pid_file {
+            // PID file check for single-instance enforcement.
+            // Keep the guard alive for the full agent lifetime.
+            let _pid_file_guard = if let Some(pid_path) = pid_file {
                 match resource_guard::PidFileGuard::acquire(pid_path) {
-                    Ok(Some(_guard)) => {
-                        // PID file acquired, it will be cleaned up on drop
+                    Ok(Some(guard)) => {
                         println!("acquired PID file lock at {}", pid_path.display());
+                        Some(guard)
                     }
                     Ok(None) => {
                         return Err(anyhow!(
@@ -1305,9 +1427,12 @@ async fn main() -> Result<()> {
                     }
                     Err(e) => {
                         eprintln!("warning: failed to acquire PID file: {}", e);
+                        None
                     }
                 }
-            }
+            } else {
+                None
+            };
 
             let config = load_optional_config(&args)?;
             let control_urls = resolve_control_urls(&args, config.as_ref())?;
@@ -1334,6 +1459,7 @@ async fn main() -> Result<()> {
             // Create resource guard for automatic cleanup on panic/unexpected exit
             let resource_guard = resource_guard::AsyncManagedResources::new();
             resource_guard.set_interface(iface.clone(), (*backend).into()).await;
+            resource_guard.set_nftables_enabled(true).await;
             let admin_token = resolve_admin_token(&args);
             let profile = args.profile.clone();
             let stun_servers = gather_stun_servers(
@@ -1468,7 +1594,8 @@ async fn main() -> Result<()> {
             let mut last_revision = startup_netmap.revision;
 
             let mut interval = tokio::time::interval(Duration::from_secs(*heartbeat_interval));
-            let mut shutdown = Box::pin(wait_for_shutdown_signal());
+            let mut shutdown =
+                Box::pin(wait_for_shutdown_signal(matches!(*backend, WgBackend::Kernel)));
             println!(
                 "agent running for node {} on network {}",
                 state.node_id, state.network_id
@@ -1664,52 +1791,57 @@ async fn main() -> Result<()> {
             profiles,
             agent_arg,
         } => {
+            platform::require_linux_data_plane("daemon")?;
             run_daemon(&args, profiles, agent_arg).await?;
         }
-        Command::Router { command } => match command {
-            RouterCommand::Enable {
-                interface,
-                out_interface,
-                map,
-                no_snat,
-            } => {
-                let iface = interface
-                    .clone()
-                    .unwrap_or_else(|| default_interface_name(&args.profile));
-                let out_iface = router::resolve_out_interface(out_interface.clone()).await?;
-                router::enable_forwarding(&iface, &out_iface, !*no_snat).await?;
-                if !map.is_empty() {
-                    let maps = parse_route_maps(map)?;
-                    router::apply_route_maps(&iface, &out_iface, &maps).await?;
-                }
+        Command::Router { command } => {
+            platform::require_linux_data_plane("router")?;
+            match command {
+                RouterCommand::Enable {
+                    interface,
+                    out_interface,
+                    map,
+                    no_snat,
+                } => {
+                    let iface = interface
+                        .clone()
+                        .unwrap_or_else(|| default_interface_name(&args.profile));
+                    let out_iface = router::resolve_out_interface(out_interface.clone()).await?;
+                    router::enable_forwarding(&iface, &out_iface, !*no_snat).await?;
+                    if !map.is_empty() {
+                        let maps = parse_route_maps(map)?;
+                        router::apply_route_maps(&iface, &out_iface, &maps).await?;
+                    }
 
-                if *no_snat {
-                    let config = load_optional_config(&args)?;
-                    let control_urls = resolve_control_urls(&args, config.as_ref())?;
-                    let tls_pin = resolve_tls_pin(&args, &config);
-                    let state_path = resolve_state_path(&args)?;
-                    let mut state = load_state(&state_path)?
-                        .ok_or_else(|| anyhow!("state not found for profile {}", args.profile))?;
-                    let netmap =
-                        ensure_netmap(&control_urls, tls_pin, &mut state, &state_path).await?;
-                    let (lan_v4, lan_v6) = router::interface_ips(&out_iface).await?;
-                    print_return_route_guidance(&netmap, &iface, &out_iface, lan_v4, lan_v6);
-                }
+                    if *no_snat {
+                        let config = load_optional_config(&args)?;
+                        let control_urls = resolve_control_urls(&args, config.as_ref())?;
+                        let tls_pin = resolve_tls_pin(&args, &config);
+                        let state_path = resolve_state_path(&args)?;
+                        let mut state = load_state(&state_path)?.ok_or_else(|| {
+                            anyhow!("state not found for profile {}", args.profile)
+                        })?;
+                        let netmap =
+                            ensure_netmap(&control_urls, tls_pin, &mut state, &state_path).await?;
+                        let (lan_v4, lan_v6) = router::interface_ips(&out_iface).await?;
+                        print_return_route_guidance(&netmap, &iface, &out_iface, lan_v4, lan_v6);
+                    }
 
-                println!("forwarding enabled for {} -> {}", iface, out_iface);
+                    println!("forwarding enabled for {} -> {}", iface, out_iface);
+                }
+                RouterCommand::Disable {
+                    interface,
+                    out_interface,
+                } => {
+                    let iface = interface
+                        .clone()
+                        .unwrap_or_else(|| default_interface_name(&args.profile));
+                    let out_iface = router::resolve_out_interface(out_interface.clone()).await?;
+                    router::disable_forwarding(&iface, &out_iface).await?;
+                    println!("forwarding disabled for {} -> {}", iface, out_iface);
+                }
             }
-            RouterCommand::Disable {
-                interface,
-                out_interface,
-            } => {
-                let iface = interface
-                    .clone()
-                    .unwrap_or_else(|| default_interface_name(&args.profile));
-                let out_iface = router::resolve_out_interface(out_interface.clone()).await?;
-                router::disable_forwarding(&iface, &out_iface).await?;
-                println!("forwarding disabled for {} -> {}", iface, out_iface);
-            }
-        },
+        }
         Command::RelayUdp { command } => {
             let config = load_optional_config(&args)?;
             let control_urls = resolve_control_urls(&args, config.as_ref())?;
@@ -1837,6 +1969,31 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Command::Platform { json } => {
+            let profile = platform::current();
+            if *json {
+                let payload = serde_json::json!({
+                    "os": profile.os,
+                    "arch": profile.arch,
+                    "control_plane": profile.control_plane.as_str(),
+                    "data_plane": profile.data_plane.as_str(),
+                    "service_integration": profile.service_integration.as_str(),
+                    "service_managers": profile.service_managers,
+                    "note": profile.note,
+                });
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+            } else {
+                println!("platform: {}-{}", profile.os, profile.arch);
+                println!("control_plane: {}", profile.control_plane.as_str());
+                println!("data_plane: {}", profile.data_plane.as_str());
+                println!(
+                    "service_integration: {}",
+                    profile.service_integration.as_str()
+                );
+                println!("service_managers: {}", profile.service_managers.join(", "));
+                println!("note: {}", profile.note);
+            }
+        }
         Command::Dns {
             format,
             output,
@@ -1904,6 +2061,7 @@ async fn main() -> Result<()> {
             let listen_addr: SocketAddr = listen.parse().context("invalid listen address")?;
             let _state = dns_server::spawn(listen_addr, netmap.clone())?;
             if *apply_resolver {
+                platform::require_linux_service_integration("dns-serve --apply-resolver")?;
                 if listen_addr.port() != 53 {
                     return Err(anyhow!("dns listen port must be 53 to apply resolver"));
                 }
@@ -2049,29 +2207,24 @@ fn resolve_state_path(args: &Args) -> Result<PathBuf> {
     Ok(state_path(&base))
 }
 
-async fn wait_for_shutdown_signal() {
+async fn wait_for_shutdown_signal(handle_sigterm: bool) {
+    #[cfg(not(unix))]
+    let _ = handle_sigterm;
+
     #[cfg(unix)]
-    {
+    if handle_sigterm {
         use tokio::signal::unix::{signal, SignalKind};
 
-        let mut terminate = match signal(SignalKind::terminate()) {
-            Ok(stream) => stream,
-            Err(_) => {
-                let _ = tokio::signal::ctrl_c().await;
-                return;
+        if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
             }
-        };
-
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = terminate.recv() => {}
+            return;
         }
     }
 
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 async fn run_daemon(
@@ -2155,7 +2308,7 @@ async fn run_daemon(
     }
 
     println!("daemon managing {} profile(s)", profiles.len());
-    let mut shutdown = Box::pin(wait_for_shutdown_signal());
+    let mut shutdown = Box::pin(wait_for_shutdown_signal(true));
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
 
     loop {
@@ -2451,6 +2604,26 @@ fn default_node_name() -> String {
         .unwrap_or_else(|_| "node".to_string())
 }
 
+fn resolve_machine_keys(machine_private_key_file: Option<&PathBuf>) -> Result<keys::KeyPair> {
+    if let Some(path) = machine_private_key_file {
+        let private = keys::read_private_key_file(path)?;
+        let key_pair = keys::machine_keys_from_private_base64(&private)
+            .with_context(|| format!("invalid machine key file {}", path.display()))?;
+        return Ok(key_pair);
+    }
+    Ok(keys::generate_machine_keys())
+}
+
+fn resolve_wg_keys(wg_private_key_file: Option<&PathBuf>) -> Result<keys::KeyPair> {
+    if let Some(path) = wg_private_key_file {
+        let private = keys::read_private_key_file(path)?;
+        let key_pair = keys::wg_keys_from_private_base64(&private)
+            .with_context(|| format!("invalid wireguard key file {}", path.display()))?;
+        return Ok(key_pair);
+    }
+    Ok(keys::generate_wg_keys())
+}
+
 fn default_interface_name(profile: &str) -> String {
     let mut name = format!("ls-{}", profile);
     if name.len() > 15 {
@@ -2461,6 +2634,26 @@ fn default_interface_name(profile: &str) -> String {
 
 fn now_unix() -> i64 {
     OffsetDateTime::now_utc().unix_timestamp()
+}
+
+fn build_admin_login_approval_url(
+    admin_url: &str,
+    network_id: &str,
+    auth_path: &str,
+    auto_approve: bool,
+) -> Result<String> {
+    let mut url = url::Url::parse(admin_url)
+        .with_context(|| format!("invalid --admin-url: {}", admin_url))?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("ls_join", "1");
+        pairs.append_pair("network_id", network_id);
+        pairs.append_pair("auth_path", auth_path);
+        if auto_approve {
+            pairs.append_pair("ls_auto_approve", "1");
+        }
+    }
+    Ok(url.to_string())
 }
 
 fn format_handshake_age(when: Option<SystemTime>) -> String {
@@ -2677,17 +2870,31 @@ fn apply_hosts_file(path: &PathBuf, profile: &str, netmap: &model::NetMap) -> Re
 }
 
 fn print_relay_config(netmap: &model::NetMap) {
-    let relay = match &netmap.relay {
-        Some(relay) => relay,
-        None => {
-            println!("relay: none");
-            return;
+    let mut output = String::new();
+    if let Some(relay) = &netmap.relay {
+        output.push_str(&format!("stun: {}\n", relay.stun_servers.join(", ")));
+        output.push_str(&format!("turn: {}\n", relay.turn_servers.join(", ")));
+        output.push_str(&format!(
+            "stream-relay: {}\n",
+            relay.stream_relay_servers.join(", ")
+        ));
+        output.push_str(&format!(
+            "udp-relay: {}\n",
+            relay.udp_relay_servers.join(", ")
+        ));
+    } else {
+        output.push_str("relay: none\n");
+    }
+    write_stdout_best_effort(&output);
+}
+
+fn write_stdout_best_effort(text: &str) {
+    let mut stdout = std::io::stdout().lock();
+    if let Err(err) = stdout.write_all(text.as_bytes()) {
+        if err.kind() != std::io::ErrorKind::BrokenPipe {
+            eprintln!("failed writing output: {}", err);
         }
-    };
-    println!("stun: {}", relay.stun_servers.join(", "));
-    println!("turn: {}", relay.turn_servers.join(", "));
-    println!("stream-relay: {}", relay.stream_relay_servers.join(", "));
-    println!("udp-relay: {}", relay.udp_relay_servers.join(", "));
+    }
 }
 
 async fn apply_netmap_update(
@@ -3088,4 +3295,93 @@ fn print_return_route_guidance(
         "  # traffic from {} will be forwarded out {}",
         wg_interface, out_interface
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_admin_login_approval_url, resolve_machine_keys, resolve_wg_keys};
+    use anyhow::Result;
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn build_admin_login_approval_url_sets_expected_query_params() -> Result<()> {
+        let url = build_admin_login_approval_url(
+            "https://admin.example.com/",
+            "net-123",
+            "/v1/register/approve/node-1/secret-1",
+            false,
+        )?;
+        let parsed = url::Url::parse(&url)?;
+        assert_eq!(parsed.scheme(), "https");
+        assert_eq!(parsed.host_str(), Some("admin.example.com"));
+        let params: std::collections::HashMap<String, String> = parsed.query_pairs().into_owned().collect();
+        assert_eq!(params.get("ls_join"), Some(&"1".to_string()));
+        assert_eq!(params.get("network_id"), Some(&"net-123".to_string()));
+        assert_eq!(
+            params.get("auth_path"),
+            Some(&"/v1/register/approve/node-1/secret-1".to_string())
+        );
+        assert_eq!(params.get("ls_auto_approve"), None);
+        Ok(())
+    }
+
+    #[test]
+    fn build_admin_login_approval_url_can_enable_auto_approve() -> Result<()> {
+        let url = build_admin_login_approval_url(
+            "https://admin.example.com/",
+            "net-123",
+            "/v1/register/approve/node-1/secret-1",
+            true,
+        )?;
+        let parsed = url::Url::parse(&url)?;
+        let params: std::collections::HashMap<String, String> =
+            parsed.query_pairs().into_owned().collect();
+        assert_eq!(params.get("ls_join"), Some(&"1".to_string()));
+        assert_eq!(params.get("ls_auto_approve"), Some(&"1".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn build_admin_login_approval_url_rejects_invalid_admin_url() {
+        let result = build_admin_login_approval_url(
+            "not-a-url",
+            "net-123",
+            "/v1/register/approve/node-1/secret-1",
+            false,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_machine_keys_reads_private_key_file() -> Result<()> {
+        let private = STANDARD.encode([3u8; 32]);
+        let path = write_temp_key_file("machine", &private)?;
+        let pair = resolve_machine_keys(Some(&path))?;
+        assert_eq!(pair.private_key, private);
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_wg_keys_reads_private_key_file() -> Result<()> {
+        let private = STANDARD.encode([5u8; 32]);
+        let path = write_temp_key_file("wg", &private)?;
+        let pair = resolve_wg_keys(Some(&path))?;
+        assert_eq!(pair.private_key, private);
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    fn write_temp_key_file(prefix: &str, private: &str) -> Result<PathBuf> {
+        let mut path = std::env::temp_dir();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+        path.push(format!("lightscale-{}-{}.key", prefix, nonce));
+        std::fs::write(&path, private)?;
+        Ok(path)
+    }
 }

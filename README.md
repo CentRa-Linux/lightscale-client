@@ -3,8 +3,8 @@
 Minimal control-plane client for Lightscale. It registers nodes, sends heartbeats, fetches
 netmaps, and can manage the WireGuard data plane (kernel or userspace) with basic NAT traversal.
 
-This client already uses profile-scoped state files so multiple networks can be supported later by
-running separate profiles.
+This client uses profile-scoped state files, and can run multiple profiles/networks at once with
+the `daemon` command (no systemd-specific runtime required).
 
 ## Configure a profile
 
@@ -24,6 +24,20 @@ cargo run -- --profile default init http://10.0.0.1:8080,http://10.0.0.1:8081
 cargo run -- --profile default register <token> --node-name laptop
 ```
 
+Register with fixed private keys:
+
+```sh
+cargo run -- --profile default register <token> --node-name laptop \
+  --machine-private-key-file /etc/lightscale/keys/machine.key \
+  --wg-private-key-file /etc/lightscale/keys/wg.key
+```
+
+First-time bootstrap with an explicit control URL:
+
+```sh
+cargo run -- --profile default --bootstrap-url http://127.0.0.1:8080 register <token> --node-name laptop
+```
+
 Register a node with an auth URL flow:
 
 ```sh
@@ -31,6 +45,41 @@ cargo run -- --profile default register-url <network_id> --node-name laptop
 ```
 
 The command prints a one-time approval URL. Open it in a browser (or curl it) to approve the node.
+Successful registration stores the resolved control URLs in the profile config for later runs.
+
+If you use `lightscale-admin`, pass `--admin-url` to print a login+approval URL:
+
+```sh
+cargo run -- --profile default register-url <network_id> --node-name laptop \
+  --admin-url https://admin.example.com/
+```
+
+That URL requires login first, then shows an explicit confirmation button by default.
+
+If you want login-only approval (no extra button), add `--admin-auto-approve`:
+
+```sh
+cargo run -- --profile default register-url <network_id> --node-name laptop \
+  --admin-url https://admin.example.com/ \
+  --admin-auto-approve
+```
+
+Approve immediately in one command (no enrollment token file):
+
+```sh
+cargo run -- --profile default register-url <network_id> --node-name laptop --approve
+```
+
+Use fixed private keys (for declarative/static host provisioning):
+
+```sh
+cargo run -- --profile default register-url <network_id> --node-name laptop \
+  --machine-private-key-file /etc/lightscale/keys/machine.key \
+  --wg-private-key-file /etc/lightscale/keys/wg.key
+```
+
+`--machine-private-key-file` and `--wg-private-key-file` expect base64-encoded
+32-byte private keys.
 
 ## Admin actions
 
@@ -121,6 +170,24 @@ Include WireGuard peer info (handshake age + endpoint):
 cargo run -- --profile default status --wg
 ```
 
+Inspect host platform support tiers:
+
+```sh
+cargo run -- platform
+```
+
+JSON output (for automation/CI checks):
+
+```sh
+cargo run -- platform --json
+```
+
+`wg-up`, `wg-down`, `agent`, `daemon`, and `router` are explicitly guarded as
+Linux-only data-plane commands.
+
+Official support tiers (Linux full client, desktop control-plane tier, mobile
+integration contract) are documented in `../docs/platform-support.md`.
+
 ## Configure WireGuard (Linux)
 
 Bring up an interface using the latest netmap:
@@ -189,6 +256,13 @@ sudo cargo run -- --profile default agent --listen-port 51820 \
   --endpoint-stale-after 15 --endpoint-max-rotations 2
 ```
 
+When relay is active, periodically re-probe direct paths and return to direct when it works:
+
+```sh
+sudo cargo run -- --profile default agent --listen-port 51820 --stream-relay \
+  --relay-reprobe-after 60
+```
+
 Use boringtun backend in the agent:
 
 ```sh
@@ -215,6 +289,188 @@ Probe peers when netmap updates arrive (UDP probe to endpoints, no ICMP):
 
 ```sh
 sudo cargo run -- --profile default agent --listen-port 51820 --probe-peers
+```
+
+## Run multiple profiles from config (daemon mode)
+
+You can run multiple networks/profiles in one command:
+
+```sh
+sudo lightscale-client --config /etc/lightscale/config.json daemon
+```
+
+`daemon` profile selection order:
+
+- Use `--profiles` when provided.
+- Otherwise start all profiles with `autostart: true`.
+- If none are marked `autostart`, fall back to `--profile` (default: `default`).
+
+This keeps single-profile usage simple: after registration, plain `daemon` works
+without `--profile` or `--state-dir` flags.
+
+```sh
+sudo lightscale-client daemon
+```
+
+You can also target specific profiles:
+
+```sh
+sudo lightscale-client --config /etc/lightscale/config.json daemon --profiles infra,lab
+```
+
+If a selected profile has no `agent_args`, you can provide fallback runtime args from CLI:
+
+```sh
+sudo lightscale-client daemon --profiles infra --agent-arg=--listen-port --agent-arg=51820
+```
+
+Example config (all runtime flags live in config, including multi-network setup):
+
+```json
+{
+  "profiles": {
+    "infra": {
+      "control_urls": ["https://cp1.example.com", "https://cp2.example.com"],
+      "tls_pinned_sha256": "....",
+      "autostart": true,
+      "state_dir": "/var/lib/lightscale-client/infra",
+      "agent_args": [
+        "--listen-port", "51820",
+        "--apply-routes",
+        "--stun",
+        "--stream-relay",
+        "--probe-peers"
+      ]
+    },
+    "lab": {
+      "control_urls": ["https://lab-cp.example.com"],
+      "autostart": true,
+      "state_dir": "/var/lib/lightscale-client/lab",
+      "agent_args": [
+        "--listen-port", "51821",
+        "--apply-routes"
+      ]
+    }
+  }
+}
+```
+
+## Linux installer script (systemd/OpenRC/procd)
+
+For non-NixOS Linux and embedded distros, use the repository installer:
+
+```sh
+sudo ./packaging/linux/install-lightscale-client.sh \
+  --control-url https://vpn.example.com:8080 \
+  --register-url-network-id <network-id>
+```
+
+The script detects `systemd`, `OpenRC`, or `procd` (`--service-manager auto`)
+and installs a matching service file. Use `--dry-run` to preview generated files.
+The installer is a Bash script. `.deb`/`.rpm`/Alpine `.apk` package metadata
+includes a `bash` runtime dependency. For OpenWrt native packages, install
+`bash` before running the installer helper script.
+
+## Build distro packages (.deb/.rpm/.apk)
+
+Build release packages from an already-compiled binary:
+
+```sh
+cargo build --release
+# prerequisite: fpm + rpmbuild
+./packaging/linux/build-packages.sh
+```
+
+Build only selected formats:
+
+```sh
+./packaging/linux/build-packages.sh --formats deb,rpm
+./packaging/linux/build-packages.sh --formats apk
+```
+
+For `apk` (Alpine), use a musl-compatible binary
+(for example built on Alpine with `RUSTFLAGS="-C target-feature=-crt-static"`),
+then pass it via `--bin-path`.
+
+Note: `build-packages.sh` emits Alpine-format `.apk` packages. OpenWrt requires
+its own feed package format (`apk` v3), so OpenWrt package artifacts are tracked
+separately.
+
+## Build OpenWrt native package (apk v3 feed format)
+
+Use the OpenWrt SDK packager with an OpenWrt-compatible (musl) binary:
+
+```sh
+./packaging/openwrt/build-openwrt-package.sh \
+  --bin-path dist/apk-bin/lightscale-client-musl
+```
+
+Outputs are written to `dist/packages-openwrt/` (for example
+`lightscale-client-<version>-r<release>.apk`).
+
+Run OpenWrt install smoke checks inside an OpenWrt environment:
+
+```sh
+./packaging/openwrt/smoke-openwrt-package.sh \
+  --package dist/packages-openwrt/<file>.apk
+```
+
+The OpenWrt package ships the installer helper at
+`/usr/lib/lightscale/install-lightscale-client.sh`; this helper requires `bash`.
+
+## Smoke test distro packages (.deb/.rpm/.apk)
+
+Outputs are written to `dist/packages/`:
+
+- `lightscale-client_*.deb`
+- `lightscale-client-*.rpm`
+- `lightscale-client-*.apk`
+
+Run install smoke tests inside target distro environments:
+
+```sh
+./packaging/linux/smoke-package-install.sh --format deb --package dist/packages/<file>.deb
+./packaging/linux/smoke-package-install.sh --format rpm --package dist/packages/<file>.rpm
+./packaging/linux/smoke-package-install.sh --format apk --package dist/packages/<file>.apk
+```
+
+## Systemd-less Linux / OpenWrt-style runtime
+
+`lightscale-client` does not require systemd. After initial `init` + registration, run
+the daemon directly and supervise it with your distro init (or a shell script).
+
+OpenWrt (no-systemd) can run the same client binary and use the `procd` service
+generation path. Build/copy a musl binary first, then run:
+
+```sh
+cp ./lightscale-client /usr/local/bin/lightscale-client
+./packaging/linux/install-lightscale-client.sh \
+  --bin-src /usr/local/bin/lightscale-client \
+  --bin-dest /usr/local/bin/lightscale-client \
+  --service-manager procd \
+  --control-url https://vpn.example.com:8080 \
+  --register-url-network-id <network-id>
+```
+
+Single-profile example:
+
+```sh
+lightscale-client --profile edge --config /etc/lightscale/config.json \
+  --state-dir /var/lib/lightscale/edge \
+  daemon --profiles edge \
+  --agent-arg=--listen-port --agent-arg=51820 \
+  --agent-arg=--heartbeat-interval --agent-arg=10 \
+  --agent-arg=--longpoll-timeout --agent-arg=10 \
+  --agent-arg=--stream-relay
+```
+
+One-command URL approval bootstrap without enrollment token file:
+
+```sh
+lightscale-client --profile edge --config /etc/lightscale/config.json \
+  --state-dir /var/lib/lightscale/edge \
+  --bootstrap-url https://vpn.example.com:8080 \
+  register-url <network-id> --approve
 ```
 
 ## Enable subnet/exit routing (Linux)

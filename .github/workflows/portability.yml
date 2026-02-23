@@ -1,0 +1,79 @@
+name: portability
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-platform:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libmnl-dev libnftnl-dev
+
+      - name: Cargo check (linux)
+        run: cargo check
+
+      - name: Platform guard tests
+        run: cargo test platform::tests
+
+      - name: Platform command smoke
+        run: |
+          cargo run -- platform --json > /tmp/platform-linux.json
+          grep -q '"os": "linux"' /tmp/platform-linux.json
+
+  macos-platform:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo check (macOS)
+        run: cargo check
+
+      - name: Platform command smoke
+        run: |
+          cargo run -- platform --json > /tmp/platform-macos.json
+          grep -q '"os": "macos"' /tmp/platform-macos.json
+
+  windows-platform:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo check (Windows)
+        run: cargo check
+
+      - name: Platform command smoke
+        shell: pwsh
+        run: |
+          cargo run -- platform --json > platform-windows.json
+          $payload = Get-Content platform-windows.json -Raw
+          if (-not ($payload -match '"os": "windows"')) {
+            throw "platform command output does not report windows"
+          }

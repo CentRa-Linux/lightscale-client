@@ -74,7 +74,9 @@ fn parse_deliver(buf: &[u8]) -> Option<(String, Vec<u8>)> {
         return None;
     }
     let from_end = offset + from_len;
-    let from_id = std::str::from_utf8(&buf[offset..from_end]).ok()?.to_string();
+    let from_id = std::str::from_utf8(&buf[offset..from_end])
+        .ok()?
+        .to_string();
     let payload = buf[from_end..].to_vec();
     Some((from_id, payload))
 }

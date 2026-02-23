@@ -8,12 +8,22 @@ pub struct ClientConfig {
     pub profiles: HashMap<String, ProfileConfig>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct ProfileConfig {
-    #[serde(default, deserialize_with = "deserialize_control_urls", alias = "control_url")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_control_urls",
+        alias = "control_url"
+    )]
     pub control_urls: Vec<String>,
     #[serde(default)]
     pub tls_pinned_sha256: Option<String>,
+    #[serde(default)]
+    pub autostart: bool,
+    #[serde(default)]
+    pub state_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub agent_args: Vec<String>,
 }
 
 fn deserialize_control_urls<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
