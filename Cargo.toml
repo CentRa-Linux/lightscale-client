@@ -29,7 +29,6 @@ tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-t
 tokio-rustls = "0.26"
 url = "2"
 webpki-roots = "0.26"
-wireguard-control = "1.7"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -37,3 +36,4 @@ nftnl = "0.9"
 mnl = "0.2"
 rtnetlink = "0.20"
 netlink-packet-route = "0.28"
+wireguard-control = "1.7"
