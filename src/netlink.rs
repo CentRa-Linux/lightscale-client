@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 use ipnet::IpNet;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
+#[cfg(target_os = "linux")]
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
 #[cfg(target_os = "linux")]

@@ -1131,6 +1131,9 @@ async fn main() -> Result<()> {
             interface,
             backend,
         } => {
+            #[cfg(not(target_os = "linux"))]
+            let _ = interface;
+
             if *wg {
                 platform::require_linux_data_plane("status --wg")?;
             }

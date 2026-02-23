@@ -2,9 +2,10 @@ use crate::model::{NetMap, Route, RouteKind};
 use crate::routes;
 use crate::state::ClientState;
 use anyhow::{anyhow, Context, Result};
-use defguard_wireguard_rs::{
-    InterfaceConfiguration, IpAddrMask, Key as DgKey, Peer as DgPeer, WGApi, WireguardInterfaceApi,
-};
+use defguard_wireguard_rs::{InterfaceConfiguration, WGApi, WireguardInterfaceApi};
+use defguard_wireguard_rs::key::Key as DgKey;
+use defguard_wireguard_rs::net::IpAddrMask;
+use defguard_wireguard_rs::peer::Peer as DgPeer;
 #[cfg(target_os = "windows")]
 use defguard_wireguard_rs::Kernel;
 #[cfg(target_os = "macos")]

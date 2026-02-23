@@ -232,6 +232,9 @@ pub async fn cleanup_existing_resources(interface: Option<&str>) -> Result<()> {
 
 /// Clean up any existing resources by interface name pattern.
 pub async fn cleanup_all_lightscale_interfaces(exclude: Option<&str>) -> Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = exclude;
+
     #[cfg(target_os = "linux")]
     {
         let netlink = crate::netlink::Netlink::new().await?;
