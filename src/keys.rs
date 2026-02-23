@@ -22,7 +22,7 @@ pub fn generate_machine_keys() -> KeyPair {
 }
 
 pub fn generate_wg_keys() -> KeyPair {
-    let secret = StaticSecret::random_from_rng(&mut OsRng);
+    let secret = StaticSecret::random_from_rng(OsRng);
     let public = PublicKey::from(&secret);
     KeyPair {
         private_key: STANDARD.encode(secret.to_bytes()),

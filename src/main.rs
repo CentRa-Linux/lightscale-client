@@ -35,7 +35,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -69,6 +69,7 @@ struct Args {
     command: Command,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 enum Command {
     Init {
@@ -1258,8 +1259,8 @@ async fn main() -> Result<()> {
             }
         }
         Command::RotateKeys { machine, wg } => {
-            let rotate_machine = *machine || (!*machine && !*wg);
-            let rotate_wg = *wg || (!*machine && !*wg);
+            let rotate_machine = *machine || !*wg;
+            let rotate_wg = *wg || !*machine;
             if !rotate_machine && !rotate_wg {
                 return Err(anyhow!("no keys selected for rotation"));
             }
@@ -1730,7 +1731,7 @@ async fn main() -> Result<()> {
                 *probe_peers,
                 *probe_timeout,
                 &profile,
-                dns_hosts_path.as_ref(),
+                dns_hosts_path.as_deref(),
             )
             .await?;
             let mut last_revision = startup_netmap.revision;
@@ -1797,7 +1798,7 @@ async fn main() -> Result<()> {
                                 *probe_peers,
                                 *probe_timeout,
                                 &profile,
-                                dns_hosts_path.as_ref(),
+                                dns_hosts_path.as_deref(),
                             )
                             .await?;
                             if let Some(state_handle) = dns_state.as_ref() {
@@ -1889,7 +1890,7 @@ async fn main() -> Result<()> {
                                 *probe_peers,
                                 *probe_timeout,
                                 &profile,
-                                dns_hosts_path.as_ref(),
+                                dns_hosts_path.as_deref(),
                             )
                             .await?;
                         }
@@ -2007,7 +2008,7 @@ async fn main() -> Result<()> {
                         .clone()
                         .or_else(|| servers.first().cloned())
                         .ok_or_else(|| anyhow!("no udp relay server configured"))?;
-                    relay_udp_send(&state, &server, &peer_id, &message, *timeout).await?;
+                    relay_udp_send(&state, &server, peer_id, message, *timeout).await?;
                     println!("relay message sent to {}", peer_id);
                 }
                 RelayUdpCommand::Listen { server } => {
@@ -2037,9 +2038,9 @@ async fn main() -> Result<()> {
                     server,
                 } => {
                     if let Some(server) = server.clone() {
-                        relay_stream_send(&state, &server, &peer_id, &message).await?;
+                        relay_stream_send(&state, &server, peer_id, message).await?;
                     } else {
-                        relay_stream_send_raw_any(&state, &servers, &peer_id, message.as_bytes())
+                        relay_stream_send_raw_any(&state, &servers, peer_id, message.as_bytes())
                             .await?;
                     }
                     println!("stream relay message sent to {}", peer_id);
@@ -2062,7 +2063,7 @@ async fn main() -> Result<()> {
                 .ok_or_else(|| anyhow!("state not found for profile {}", args.profile))?;
             let servers =
                 gather_turn_servers(&control_urls, tls_pin, &mut state, &state_path).await?;
-            let creds = build_turn_credentials(&command)?;
+            let creds = build_turn_credentials(command)?;
 
             match command {
                 RelayTurnCommand::Send {
@@ -2575,15 +2576,12 @@ async fn run_daemon(
             _ = ticker.tick() => {
                 for profile in &mut profiles {
                     if let Some(child) = profile.child.as_mut() {
-                        match child
+                        if let Some(status) = child
                             .try_wait()
                             .with_context(|| format!("failed to poll agent process for profile {}", profile.name))?
                         {
-                            Some(status) => {
-                                eprintln!("agent for profile {} exited: {}", profile.name, status);
-                                profile.child = None;
-                            }
-                            None => {}
+                            eprintln!("agent for profile {} exited: {}", profile.name, status);
+                            profile.child = None;
                         }
                     }
 
@@ -3089,7 +3087,7 @@ fn default_hosts_path() -> PathBuf {
     }
 }
 
-fn apply_hosts_file(path: &PathBuf, profile: &str, netmap: &model::NetMap) -> Result<()> {
+fn apply_hosts_file(path: &Path, profile: &str, netmap: &model::NetMap) -> Result<()> {
     let start = format!("# lightscale:{} begin", profile);
     let end = format!("# lightscale:{} end", profile);
     let contents = std::fs::read_to_string(path).unwrap_or_default();
@@ -3156,9 +3154,10 @@ fn write_stdout_best_effort(text: &str) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_netmap_update(
     data_plane: &dyn data_plane::DataPlane,
-    state_path: &PathBuf,
+    state_path: &Path,
     state: &mut ClientState,
     netmap: model::NetMap,
     wg_cfg: &wg::WgConfig,
@@ -3167,7 +3166,7 @@ async fn apply_netmap_update(
     probe_peers: bool,
     probe_timeout: u64,
     profile: &str,
-    dns_hosts_path: Option<&PathBuf>,
+    dns_hosts_path: Option<&Path>,
 ) -> Result<()> {
     state.ipv4 = netmap.node.ipv4.clone();
     state.ipv6 = netmap.node.ipv6.clone();
@@ -3210,7 +3209,7 @@ async fn gather_dns_servers(
     control_urls: &[String],
     tls_pin: Option<String>,
     state: &mut ClientState,
-    state_path: &PathBuf,
+    state_path: &Path,
     overrides: &[String],
 ) -> Result<Vec<String>> {
     if !overrides.is_empty() {
@@ -3415,7 +3414,7 @@ async fn gather_stun_servers(
     control_urls: &[String],
     tls_pin: Option<String>,
     state: &mut ClientState,
-    state_path: &PathBuf,
+    state_path: &Path,
     overrides: &[String],
 ) -> Result<Vec<String>> {
     if !overrides.is_empty() {
@@ -3444,7 +3443,7 @@ async fn gather_udp_relay_servers(
     control_urls: &[String],
     tls_pin: Option<String>,
     state: &mut ClientState,
-    state_path: &PathBuf,
+    state_path: &Path,
 ) -> Result<Vec<String>> {
     if let Some(netmap) = state.last_netmap.as_ref() {
         if let Some(relay) = &netmap.relay {
@@ -3468,7 +3467,7 @@ async fn gather_stream_relay_servers(
     control_urls: &[String],
     tls_pin: Option<String>,
     state: &mut ClientState,
-    state_path: &PathBuf,
+    state_path: &Path,
 ) -> Result<Vec<String>> {
     if let Some(netmap) = state.last_netmap.as_ref() {
         if let Some(relay) = &netmap.relay {
@@ -3492,7 +3491,7 @@ async fn gather_turn_servers(
     control_urls: &[String],
     tls_pin: Option<String>,
     state: &mut ClientState,
-    state_path: &PathBuf,
+    state_path: &Path,
 ) -> Result<Vec<String>> {
     if let Some(netmap) = state.last_netmap.as_ref() {
         if let Some(relay) = &netmap.relay {
@@ -3591,12 +3590,9 @@ async fn relay_stream_listen(state: &ClientState, server: &str) -> Result<()> {
     stream_relay::write_register(&mut stream, &state.node_id).await?;
     println!("listening on stream relay {} as {}", server, state.node_id);
     loop {
-        match stream_relay::read_deliver(&mut stream).await? {
-            Some((from, payload)) => {
-                let text = String::from_utf8_lossy(&payload);
-                println!("from {}: {}", from, text);
-            }
-            None => {}
+        if let Some((from, payload)) = stream_relay::read_deliver(&mut stream).await? {
+            let text = String::from_utf8_lossy(&payload);
+            println!("from {}: {}", from, text);
         }
     }
 }
@@ -3720,7 +3716,7 @@ async fn ensure_netmap(
     control_urls: &[String],
     tls_pin: Option<String>,
     state: &mut ClientState,
-    state_path: &PathBuf,
+    state_path: &Path,
 ) -> Result<model::NetMap> {
     if let Some(netmap) = state.last_netmap.clone() {
         return Ok(netmap);

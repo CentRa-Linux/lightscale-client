@@ -54,7 +54,7 @@ mod imp {
             (NAT_TABLE, ProtoFamily::Ipv4),
         ] {
             let mut batch = Batch::new();
-            let table = Table::new(&cstr(name), family);
+            let table = Table::new(cstr(name), family);
             batch.add(&table, MsgType::Del);
             let _ = send_batch(batch); // ignore ENOENT
         }
@@ -65,7 +65,7 @@ mod imp {
         // Delete existing table for idempotency (ignore error if not present).
         {
             let mut del = Batch::new();
-            let table = Table::new(&cstr(FILTER_TABLE), ProtoFamily::Inet);
+            let table = Table::new(cstr(FILTER_TABLE), ProtoFamily::Inet);
             del.add(&table, MsgType::Del);
             let _ = send_batch(del);
         }
@@ -127,7 +127,7 @@ mod imp {
             let table_name = cstr(NAT_TABLE);
             let table = Table::new(&table_name, ProtoFamily::Ipv4);
             del.add(&table, MsgType::Add); // ensure table exists for del chain
-            let chain = Chain::new(&cstr(NAT_CHAIN), &table);
+            let chain = Chain::new(cstr(NAT_CHAIN), &table);
             del.add(&chain, MsgType::Del);
             let _ = send_batch(del);
         }
@@ -171,7 +171,7 @@ mod imp {
             let table = Table::new(&table_name, ProtoFamily::Ipv4);
             del.add(&table, MsgType::Add);
             for name in [MAP_PREROUTING_CHAIN, MAP_POSTROUTING_CHAIN] {
-                let chain = Chain::new(&cstr(name), &table);
+                let chain = Chain::new(cstr(name), &table);
                 del.add(&chain, MsgType::Del);
             }
             let _ = send_batch(del);

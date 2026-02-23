@@ -89,7 +89,7 @@ impl ControlClient {
     fn node_or_admin_auth(&self) -> Option<&str> {
         self.node_token
             .as_deref()
-            .or_else(|| self.admin_token.as_deref())
+            .or(self.admin_token.as_deref())
     }
 
     pub async fn register(&self, request: RegisterRequest) -> Result<RegisterResponse> {

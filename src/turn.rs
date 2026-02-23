@@ -270,7 +270,7 @@ fn add_message_integrity(mut msg: Vec<u8>, key: &[u8]) -> Result<Vec<u8>> {
     let mi_offset = msg.len() + 4;
     msg.extend_from_slice(&ATTR_MESSAGE_INTEGRITY.to_be_bytes());
     msg.extend_from_slice(&(20u16).to_be_bytes());
-    msg.extend_from_slice(&vec![0u8; 20]);
+    msg.extend_from_slice(&[0u8; 20]);
 
     let mut mac = HmacSha1::new_from_slice(key).map_err(|_| anyhow!("invalid hmac key"))?;
     mac.update(&msg);

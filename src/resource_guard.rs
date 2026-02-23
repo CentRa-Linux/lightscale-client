@@ -128,7 +128,7 @@ impl ManagedResources {
 
             // Run in a new tokio runtime if needed, or use blocking approach
             if let Ok(rt) = tokio::runtime::Handle::try_current() {
-                let _ = rt.block_on(async move {
+                rt.block_on(async move {
                     if let Err(e) = crate::wg::remove(&iface, backend).await {
                         eprintln!("cleanup: failed to remove wireguard interface: {}", e);
                     } else {

@@ -135,6 +135,7 @@ pub trait WireGuardManager: Send + Sync {
 
     fn probe_peers(&self, netmap: &NetMap, timeout_seconds: u64) -> Result<()>;
 
+    #[allow(clippy::too_many_arguments)]
     fn refresh_peer_endpoints(
         &self,
         netmap: &NetMap,
@@ -208,6 +209,7 @@ pub trait DataPlane: Send + Sync {
             .probe_peers(netmap, timeout_seconds)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn wg_refresh_peer_endpoints(
         &self,
         netmap: &NetMap,
