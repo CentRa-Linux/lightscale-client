@@ -137,7 +137,10 @@ impl ManagedResources {
                 });
             } else {
                 // No runtime available, try blocking approach
-                eprintln!("cleanup: cannot remove wireguard interface {} (no async runtime)", iface);
+                eprintln!(
+                    "cleanup: cannot remove wireguard interface {} (no async runtime)",
+                    iface
+                );
             }
         }
     }
@@ -185,7 +188,6 @@ impl AsyncManagedResources {
         let mut guard = self.inner.write().await;
         guard.disable_cleanup();
     }
-
 }
 
 impl Default for AsyncManagedResources {
@@ -206,7 +208,10 @@ impl Clone for AsyncManagedResources {
 pub async fn cleanup_existing_resources(interface: Option<&str>) -> Result<()> {
     // Clean up nftables rules
     if let Err(e) = crate::firewall::reset_tables() {
-        eprintln!("pre-start: failed to reset nftables (may be expected): {}", e);
+        eprintln!(
+            "pre-start: failed to reset nftables (may be expected): {}",
+            e
+        );
     } else {
         eprintln!("pre-start: nftables rules cleaned up");
     }
@@ -217,7 +222,10 @@ pub async fn cleanup_existing_resources(interface: Option<&str>) -> Result<()> {
         for backend in [crate::wg::Backend::Kernel, crate::wg::Backend::Boringtun] {
             match crate::wg::remove(iface, backend).await {
                 Ok(_) => {
-                    eprintln!("pre-start: removed existing wireguard interface {} ({:?})", iface, backend);
+                    eprintln!(
+                        "pre-start: removed existing wireguard interface {} ({:?})",
+                        iface, backend
+                    );
                     break;
                 }
                 Err(_) => {

@@ -8,10 +8,10 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
 #[cfg(not(target_os = "linux"))]
 use std::sync::Once;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy)]
 pub struct DataPlaneCapabilities {
@@ -52,11 +52,15 @@ const PORTABLE_CAPABILITIES: DataPlaneCapabilities = DataPlaneCapabilities {
     advanced_route_policy: SupportLevel::Unsupported,
     router_mode: SupportLevel::Unsupported,
     dns_local_server: SupportLevel::Supported,
-    dns_resolver_integration: SupportLevel::Unsupported,
-    note: "Windows backend: experimental wireguard; advanced routing/resolver/service integration pending",
+    dns_resolver_integration: SupportLevel::Partial,
+    note: "Windows backend: experimental wireguard and resolver integration; advanced routing/service integration pending",
 };
 
-#[cfg(all(not(target_os = "linux"), not(target_os = "macos"), not(target_os = "windows")))]
+#[cfg(all(
+    not(target_os = "linux"),
+    not(target_os = "macos"),
+    not(target_os = "windows")
+))]
 const PORTABLE_CAPABILITIES: DataPlaneCapabilities = DataPlaneCapabilities {
     wireguard: SupportLevel::Unsupported,
     advertised_routes: SupportLevel::Unsupported,
@@ -153,7 +157,12 @@ pub trait RouteManager: Send + Sync {
 }
 
 pub trait ResolverManager: Send + Sync {
-    fn dns_spawn(&self, addr: SocketAddr, netmap: NetMap) -> Result<Arc<Mutex<NetMap>>>;
+    fn dns_spawn(
+        &self,
+        addr: SocketAddr,
+        netmap: NetMap,
+        upstream_servers: Vec<String>,
+    ) -> Result<Arc<Mutex<NetMap>>>;
 
     fn dns_apply_resolver(&self, interface: &str, domain: &str, server: IpAddr) -> Result<()>;
 
@@ -195,7 +204,8 @@ pub trait DataPlane: Send + Sync {
     }
 
     fn wg_probe_peers(&self, netmap: &NetMap, timeout_seconds: u64) -> Result<()> {
-        self.wireguard_manager().probe_peers(netmap, timeout_seconds)
+        self.wireguard_manager()
+            .probe_peers(netmap, timeout_seconds)
     }
 
     fn wg_refresh_peer_endpoints(
@@ -224,11 +234,19 @@ pub trait DataPlane: Send + Sync {
         netmap: &NetMap,
         cfg: &routes::RouteApplyConfig,
     ) -> Result<()> {
-        self.route_manager().apply_advertised_routes(netmap, cfg).await
+        self.route_manager()
+            .apply_advertised_routes(netmap, cfg)
+            .await
     }
 
-    fn dns_spawn(&self, addr: SocketAddr, netmap: NetMap) -> Result<Arc<Mutex<NetMap>>> {
-        self.resolver_manager().dns_spawn(addr, netmap)
+    fn dns_spawn(
+        &self,
+        addr: SocketAddr,
+        netmap: NetMap,
+        upstream_servers: Vec<String>,
+    ) -> Result<Arc<Mutex<NetMap>>> {
+        self.resolver_manager()
+            .dns_spawn(addr, netmap, upstream_servers)
     }
 
     fn dns_apply_resolver(&self, interface: &str, domain: &str, server: IpAddr) -> Result<()> {
@@ -304,8 +322,13 @@ impl RouteManager for LinuxRouteManager {
 struct LinuxResolverManager;
 
 impl ResolverManager for LinuxResolverManager {
-    fn dns_spawn(&self, addr: SocketAddr, netmap: NetMap) -> Result<Arc<Mutex<NetMap>>> {
-        dns_server::spawn(addr, netmap)
+    fn dns_spawn(
+        &self,
+        addr: SocketAddr,
+        netmap: NetMap,
+        upstream_servers: Vec<String>,
+    ) -> Result<Arc<Mutex<NetMap>>> {
+        dns_server::spawn(addr, netmap, upstream_servers)
     }
 
     fn dns_apply_resolver(&self, interface: &str, domain: &str, server: IpAddr) -> Result<()> {
@@ -461,8 +484,13 @@ struct PortableResolverManager;
 
 #[cfg(not(target_os = "linux"))]
 impl ResolverManager for PortableResolverManager {
-    fn dns_spawn(&self, addr: SocketAddr, netmap: NetMap) -> Result<Arc<Mutex<NetMap>>> {
-        dns_server::spawn(addr, netmap)
+    fn dns_spawn(
+        &self,
+        addr: SocketAddr,
+        netmap: NetMap,
+        upstream_servers: Vec<String>,
+    ) -> Result<Arc<Mutex<NetMap>>> {
+        dns_server::spawn(addr, netmap, upstream_servers)
     }
 
     fn dns_apply_resolver(&self, interface: &str, domain: &str, server: IpAddr) -> Result<()> {

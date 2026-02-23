@@ -2,7 +2,6 @@ use crate::model::{NetMap, Route, RouteKind};
 use crate::routes;
 use crate::state::ClientState;
 use anyhow::{anyhow, Context, Result};
-use defguard_wireguard_rs::{InterfaceConfiguration, WGApi, WireguardInterfaceApi};
 use defguard_wireguard_rs::key::Key as DgKey;
 use defguard_wireguard_rs::net::IpAddrMask;
 use defguard_wireguard_rs::peer::Peer as DgPeer;
@@ -10,10 +9,11 @@ use defguard_wireguard_rs::peer::Peer as DgPeer;
 use defguard_wireguard_rs::Kernel;
 #[cfg(target_os = "macos")]
 use defguard_wireguard_rs::Userspace;
+use defguard_wireguard_rs::{InterfaceConfiguration, WGApi, WireguardInterfaceApi};
 use ipnet::IpNet;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug)]
 pub enum Backend {
@@ -28,7 +28,17 @@ pub struct WgConfig {
 }
 
 #[derive(Default)]
-pub struct EndpointTracker;
+pub struct EndpointTracker {
+    peers: HashMap<String, PeerEndpointState>,
+}
+
+#[derive(Default)]
+struct PeerEndpointState {
+    next_index: usize,
+    rotations: usize,
+    relay_active: bool,
+    last_direct_probe_at: Option<Instant>,
+}
 
 /// Lightscale interface prefix for identification.
 pub const INTERFACE_PREFIX: &str = "ls-";
@@ -87,15 +97,386 @@ pub fn probe_peers(netmap: &NetMap, timeout_seconds: u64) -> Result<()> {
 }
 
 pub fn refresh_peer_endpoints(
-    _netmap: &NetMap,
-    _cfg: &WgConfig,
-    _tracker: &mut EndpointTracker,
-    _relay_endpoints: &HashMap<String, SocketAddr>,
-    _stale_after: Duration,
-    _max_rotations: usize,
-    _relay_reprobe_after: Duration,
+    netmap: &NetMap,
+    cfg: &WgConfig,
+    tracker: &mut EndpointTracker,
+    relay_endpoints: &HashMap<String, SocketAddr>,
+    stale_after: Duration,
+    max_rotations: usize,
+    relay_reprobe_after: Duration,
 ) -> Result<()> {
-    // TODO: implement endpoint churn handling for non-linux data planes.
+    #[cfg(target_os = "macos")]
+    {
+        refresh_peer_endpoints_macos(
+            netmap,
+            cfg,
+            tracker,
+            relay_endpoints,
+            stale_after,
+            max_rotations,
+            relay_reprobe_after,
+        )
+    }
+    #[cfg(target_os = "windows")]
+    {
+        refresh_peer_endpoints_windows(
+            netmap,
+            cfg,
+            tracker,
+            relay_endpoints,
+            stale_after,
+            max_rotations,
+            relay_reprobe_after,
+        )
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (
+            netmap,
+            cfg,
+            tracker,
+            relay_endpoints,
+            stale_after,
+            max_rotations,
+            relay_reprobe_after,
+        );
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn refresh_peer_endpoints_windows(
+    netmap: &NetMap,
+    cfg: &WgConfig,
+    tracker: &mut EndpointTracker,
+    relay_endpoints: &HashMap<String, SocketAddr>,
+    stale_after: Duration,
+    max_rotations: usize,
+    relay_reprobe_after: Duration,
+) -> Result<()> {
+    let api = WGApi::<Kernel>::new(cfg.interface.clone())
+        .context("failed to initialize Windows WireGuard API")?;
+    let host = api
+        .read_interface_data()
+        .context("failed to read Windows WireGuard interface data")?;
+    let private_key = host.private_key.clone().ok_or_else(|| {
+        anyhow!("windows endpoint refresh requires adapter private key in interface state")
+    })?;
+
+    let mut peer_info: HashMap<String, DgPeer> = HashMap::new();
+    for (key, peer) in host.peers {
+        peer_info.insert(key.to_string(), peer);
+    }
+
+    let max_rotations = max_rotations.max(1);
+    let mut desired_updates: Vec<(String, SocketAddr, Option<SocketAddr>)> = Vec::new();
+
+    for peer in &netmap.peers {
+        let endpoints: Vec<SocketAddr> = peer
+            .endpoints
+            .iter()
+            .filter_map(|endpoint| endpoint.parse().ok())
+            .collect();
+        let info = peer_info.get(&peer.wg_public_key);
+        let handshake_stale = match info.and_then(|info| info.last_handshake) {
+            Some(ts) => ts.elapsed().map(|age| age > stale_after).unwrap_or(true),
+            None => true,
+        };
+        let state = tracker.peers.entry(peer.id.clone()).or_default();
+        let relay_active_before = state.relay_active;
+        let current_endpoint = info.and_then(|info| info.endpoint);
+        let relay_endpoint = relay_endpoints.get(&peer.id).copied();
+        let current_is_relay = relay_endpoint
+            .map(|relay| Some(relay) == current_endpoint)
+            .unwrap_or(false);
+
+        if !handshake_stale {
+            state.rotations = 0;
+            if current_is_relay && !endpoints.is_empty() {
+                let should_probe = state
+                    .last_direct_probe_at
+                    .map(|ts| ts.elapsed() >= relay_reprobe_after)
+                    .unwrap_or(true);
+                if should_probe {
+                    let idx = state.next_index % endpoints.len();
+                    let desired = endpoints[idx];
+                    state.next_index = (idx + 1) % endpoints.len();
+                    state.last_direct_probe_at = Some(Instant::now());
+                    state.relay_active = false;
+                    if Some(desired) != current_endpoint {
+                        desired_updates.push((peer.id.clone(), desired, current_endpoint));
+                    }
+                    continue;
+                }
+                state.relay_active = true;
+            } else {
+                state.relay_active = false;
+            }
+            continue;
+        }
+
+        let mut desired_endpoint = None;
+
+        if state.relay_active {
+            if let Some(relay) = relay_endpoint {
+                desired_endpoint = Some(relay);
+            } else if !endpoints.is_empty() {
+                let idx = state.next_index % endpoints.len();
+                desired_endpoint = Some(endpoints[idx]);
+                state.next_index = (idx + 1) % endpoints.len();
+                state.relay_active = false;
+            }
+        } else if !endpoints.is_empty() {
+            let idx = state.next_index % endpoints.len();
+            desired_endpoint = Some(endpoints[idx]);
+            state.next_index = (idx + 1) % endpoints.len();
+            state.rotations = state.rotations.saturating_add(1);
+            if state.rotations >= max_rotations && relay_endpoint.is_some() {
+                eprintln!(
+                    "endpoint refresh peer={} enabling relay fallback after {} rotation(s)",
+                    peer.id, state.rotations
+                );
+                state.relay_active = true;
+                state.rotations = 0;
+                state.last_direct_probe_at = Some(Instant::now());
+            }
+        } else if let Some(relay) = relay_endpoint {
+            eprintln!(
+                "endpoint refresh peer={} using relay endpoint {} (no direct endpoints available)",
+                peer.id, relay
+            );
+            state.relay_active = true;
+            state.rotations = 0;
+            state.last_direct_probe_at = Some(Instant::now());
+            desired_endpoint = Some(relay);
+        }
+
+        if relay_active_before != state.relay_active {
+            eprintln!(
+                "endpoint refresh peer={} relay_active {} -> {}",
+                peer.id, relay_active_before, state.relay_active
+            );
+        }
+
+        if let Some(desired) = desired_endpoint {
+            if Some(desired) != current_endpoint {
+                desired_updates.push((peer.id.clone(), desired, current_endpoint));
+            }
+        }
+    }
+
+    if desired_updates.is_empty() {
+        return Ok(());
+    }
+
+    for (peer_id, desired, current) in &desired_updates {
+        eprintln!(
+            "endpoint refresh peer={} update {} -> {}",
+            peer_id,
+            format_opt_endpoint(*current),
+            desired
+        );
+    }
+
+    for (peer_id, desired, _current) in &desired_updates {
+        let Some(peer_meta) = netmap.peers.iter().find(|p| p.id == *peer_id) else {
+            continue;
+        };
+        let Some(host_peer) = peer_info.get_mut(&peer_meta.wg_public_key) else {
+            eprintln!(
+                "endpoint refresh peer={} skipped update because adapter peer state is unavailable",
+                peer_id
+            );
+            continue;
+        };
+        host_peer.endpoint = Some(*desired);
+    }
+
+    let interface_config = InterfaceConfiguration {
+        name: cfg.interface.clone(),
+        prvkey: private_key.to_string(),
+        addresses: vec![
+            parse_host_ip_mask(&netmap.node.ipv4, 32, "node ipv4")?,
+            parse_host_ip_mask(&netmap.node.ipv6, 128, "node ipv6")?,
+        ],
+        port: host.listen_port,
+        peers: peer_info.into_values().collect(),
+        mtu: None,
+        fwmark: None,
+    };
+    api.configure_interface(&interface_config)
+        .with_context(|| {
+            format!(
+                "failed to configure Windows WireGuard interface during endpoint refresh for {}",
+                cfg.interface
+            )
+        })?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn refresh_peer_endpoints_macos(
+    netmap: &NetMap,
+    cfg: &WgConfig,
+    tracker: &mut EndpointTracker,
+    relay_endpoints: &HashMap<String, SocketAddr>,
+    stale_after: Duration,
+    max_rotations: usize,
+    relay_reprobe_after: Duration,
+) -> Result<()> {
+    let api = WGApi::<Userspace>::new(cfg.interface.clone())
+        .context("failed to initialize macOS WireGuard API")?;
+    let host = api
+        .read_interface_data()
+        .context("failed to read macOS WireGuard interface data")?;
+
+    let mut peer_info: HashMap<String, DgPeer> = HashMap::new();
+    for (key, peer) in host.peers {
+        peer_info.insert(key.to_string(), peer);
+    }
+
+    let max_rotations = max_rotations.max(1);
+    let mut desired_updates: Vec<(String, DgPeer, SocketAddr, Option<SocketAddr>)> = Vec::new();
+
+    for peer in &netmap.peers {
+        let endpoints: Vec<SocketAddr> = peer
+            .endpoints
+            .iter()
+            .filter_map(|endpoint| endpoint.parse().ok())
+            .collect();
+        let info = peer_info.get(&peer.wg_public_key);
+        let handshake_stale = match info.and_then(|info| info.last_handshake) {
+            Some(ts) => ts.elapsed().map(|age| age > stale_after).unwrap_or(true),
+            None => true,
+        };
+        let state = tracker.peers.entry(peer.id.clone()).or_default();
+        let relay_active_before = state.relay_active;
+        let current_endpoint = info.and_then(|info| info.endpoint);
+        let relay_endpoint = relay_endpoints.get(&peer.id).copied();
+        let current_is_relay = relay_endpoint
+            .map(|relay| Some(relay) == current_endpoint)
+            .unwrap_or(false);
+
+        if !handshake_stale {
+            state.rotations = 0;
+            if current_is_relay && !endpoints.is_empty() {
+                let should_probe = state
+                    .last_direct_probe_at
+                    .map(|ts| ts.elapsed() >= relay_reprobe_after)
+                    .unwrap_or(true);
+                if should_probe {
+                    let idx = state.next_index % endpoints.len();
+                    let desired = endpoints[idx];
+                    state.next_index = (idx + 1) % endpoints.len();
+                    state.last_direct_probe_at = Some(Instant::now());
+                    state.relay_active = false;
+                    if Some(desired) != current_endpoint {
+                        if let Some(updated_peer) = info.cloned().map(|mut p| {
+                            p.endpoint = Some(desired);
+                            p
+                        }) {
+                            desired_updates.push((
+                                peer.id.clone(),
+                                updated_peer,
+                                desired,
+                                current_endpoint,
+                            ));
+                        } else {
+                            eprintln!(
+                                "endpoint refresh peer={} skipped direct reprobe update because peer state is unavailable",
+                                peer.id
+                            );
+                        }
+                    }
+                    continue;
+                }
+                state.relay_active = true;
+            } else {
+                state.relay_active = false;
+            }
+            continue;
+        }
+
+        let mut desired_endpoint = None;
+
+        if state.relay_active {
+            if let Some(relay) = relay_endpoint {
+                desired_endpoint = Some(relay);
+            } else if !endpoints.is_empty() {
+                let idx = state.next_index % endpoints.len();
+                desired_endpoint = Some(endpoints[idx]);
+                state.next_index = (idx + 1) % endpoints.len();
+                state.relay_active = false;
+            }
+        } else if !endpoints.is_empty() {
+            let idx = state.next_index % endpoints.len();
+            desired_endpoint = Some(endpoints[idx]);
+            state.next_index = (idx + 1) % endpoints.len();
+            state.rotations = state.rotations.saturating_add(1);
+            if state.rotations >= max_rotations && relay_endpoint.is_some() {
+                eprintln!(
+                    "endpoint refresh peer={} enabling relay fallback after {} rotation(s)",
+                    peer.id, state.rotations
+                );
+                state.relay_active = true;
+                state.rotations = 0;
+                state.last_direct_probe_at = Some(Instant::now());
+            }
+        } else if let Some(relay) = relay_endpoint {
+            eprintln!(
+                "endpoint refresh peer={} using relay endpoint {} (no direct endpoints available)",
+                peer.id, relay
+            );
+            state.relay_active = true;
+            state.rotations = 0;
+            state.last_direct_probe_at = Some(Instant::now());
+            desired_endpoint = Some(relay);
+        }
+
+        if relay_active_before != state.relay_active {
+            eprintln!(
+                "endpoint refresh peer={} relay_active {} -> {}",
+                peer.id, relay_active_before, state.relay_active
+            );
+        }
+
+        if let Some(desired) = desired_endpoint {
+            if Some(desired) != current_endpoint {
+                if let Some(updated_peer) = info.cloned().map(|mut p| {
+                    p.endpoint = Some(desired);
+                    p
+                }) {
+                    desired_updates.push((
+                        peer.id.clone(),
+                        updated_peer,
+                        desired,
+                        current_endpoint,
+                    ));
+                } else {
+                    eprintln!(
+                        "endpoint refresh peer={} skipped endpoint update because peer state is unavailable",
+                        peer.id
+                    );
+                }
+            }
+        }
+    }
+
+    for (peer_id, updated_peer, desired, current) in desired_updates {
+        eprintln!(
+            "endpoint refresh peer={} update {} -> {}",
+            peer_id,
+            format_opt_endpoint(current),
+            desired
+        );
+        api.configure_peer(&updated_peer).with_context(|| {
+            format!(
+                "failed to configure macOS peer endpoint refresh for peer {}",
+                peer_id
+            )
+        })?;
+    }
+
     Ok(())
 }
 
@@ -218,7 +599,10 @@ fn apply_interface_configuration(config: &InterfaceConfiguration, backend: Backe
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn apply_interface_configuration(_config: &InterfaceConfiguration, _backend: Backend) -> Result<()> {
+fn apply_interface_configuration(
+    _config: &InterfaceConfiguration,
+    _backend: Backend,
+) -> Result<()> {
     Err(anyhow!(
         "portable WireGuard data plane is only implemented for macOS and Windows"
     ))
@@ -336,4 +720,10 @@ fn probe_addr(
     if socket.send_to(b"lightscale-probe", target).is_err() {
         eprintln!("probe failed for {} (udp send)", target);
     }
+}
+
+fn format_opt_endpoint(endpoint: Option<SocketAddr>) -> String {
+    endpoint
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|| "<none>".to_string())
 }

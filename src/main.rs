@@ -34,7 +34,7 @@ use state::{default_state_dir, load_state, save_state, state_path, ClientState};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -247,15 +247,28 @@ enum Command {
         dns_hosts_path: Option<PathBuf>,
         #[arg(long)]
         dns_serve: bool,
+        #[arg(
+            long,
+            help = "Enable recommended DNS setup (equivalent to --dns-serve --dns-mode hybrid --dns-apply-resolver)"
+        )]
+        dns_auto: bool,
         #[arg(long)]
         dns_listen: Option<String>,
+        #[arg(long, value_enum, default_value = "hybrid")]
+        dns_mode: DnsMode,
+        #[arg(long, value_name = "HOST:PORT", value_delimiter = ',')]
+        dns_server: Vec<String>,
         #[arg(long)]
         dns_apply_resolver: bool,
         #[arg(long)]
         l2_relay: bool,
         #[arg(long, help = "Clean up existing resources before starting")]
         cleanup_before_start: bool,
-        #[arg(long, value_name = "PATH", help = "PID file path for single-instance enforcement")]
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "PID file path for single-instance enforcement"
+        )]
         pid_file: Option<PathBuf>,
     },
     Daemon {
@@ -302,6 +315,15 @@ enum Command {
     DnsServe {
         #[arg(long, default_value = "127.0.0.1:53")]
         listen: String,
+        #[arg(
+            long,
+            help = "Enable recommended DNS setup (equivalent to --dns-mode hybrid --apply-resolver)"
+        )]
+        auto: bool,
+        #[arg(long, value_enum, default_value = "hybrid")]
+        dns_mode: DnsMode,
+        #[arg(long, value_name = "HOST:PORT", value_delimiter = ',')]
+        dns_server: Vec<String>,
         #[arg(long)]
         apply_resolver: bool,
         #[arg(long)]
@@ -314,6 +336,13 @@ enum Command {
 enum DnsFormat {
     Hosts,
     Json,
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+enum DnsMode {
+    Local,
+    Server,
+    Hybrid,
 }
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy)]
@@ -1166,39 +1195,40 @@ async fn main() -> Result<()> {
                         WgBackend::Boringtun => wireguard_control::Backend::Userspace,
                     };
                     match iface.parse::<wireguard_control::InterfaceName>() {
-                        Ok(iface_name) => match wireguard_control::Device::get(&iface_name, backend) {
-                            Ok(device) => {
-                                println!("wg interface: {}", iface);
-                                let mut peers_by_key = HashMap::new();
-                                if let Some(netmap) = state.last_netmap.as_ref() {
-                                    for peer in &netmap.peers {
-                                        peers_by_key.insert(peer.wg_public_key.clone(), peer);
+                        Ok(iface_name) => {
+                            match wireguard_control::Device::get(&iface_name, backend) {
+                                Ok(device) => {
+                                    println!("wg interface: {}", iface);
+                                    let mut peers_by_key = HashMap::new();
+                                    if let Some(netmap) = state.last_netmap.as_ref() {
+                                        for peer in &netmap.peers {
+                                            peers_by_key.insert(peer.wg_public_key.clone(), peer);
+                                        }
                                     }
-                                }
-                                for peer in device.peers {
-                                    let key = peer.config.public_key.to_base64();
-                                    let name = peers_by_key
-                                        .get(&key)
-                                        .map(|peer| peer.name.as_str())
-                                        .unwrap_or("<unknown>");
-                                    let endpoint = peer
-                                        .config
-                                        .endpoint
-                                        .map(|ep| ep.to_string())
-                                        .unwrap_or_else(|| "none".to_string());
-                                    let handshake =
-                                        format_handshake_age(peer.stats.last_handshake_time);
-                                    let allowed_ips = if peer.config.allowed_ips.is_empty() {
-                                        "none".to_string()
-                                    } else {
-                                        peer.config
-                                            .allowed_ips
-                                            .iter()
-                                            .map(|ip| format!("{}/{}", ip.address, ip.cidr))
-                                            .collect::<Vec<_>>()
-                                            .join(",")
-                                    };
-                                    println!(
+                                    for peer in device.peers {
+                                        let key = peer.config.public_key.to_base64();
+                                        let name = peers_by_key
+                                            .get(&key)
+                                            .map(|peer| peer.name.as_str())
+                                            .unwrap_or("<unknown>");
+                                        let endpoint = peer
+                                            .config
+                                            .endpoint
+                                            .map(|ep| ep.to_string())
+                                            .unwrap_or_else(|| "none".to_string());
+                                        let handshake =
+                                            format_handshake_age(peer.stats.last_handshake_time);
+                                        let allowed_ips = if peer.config.allowed_ips.is_empty() {
+                                            "none".to_string()
+                                        } else {
+                                            peer.config
+                                                .allowed_ips
+                                                .iter()
+                                                .map(|ip| format!("{}/{}", ip.address, ip.cidr))
+                                                .collect::<Vec<_>>()
+                                                .join(",")
+                                        };
+                                        println!(
                                         "peer {} {} handshake={} endpoint={} rx={} tx={} allowed_ips={}",
                                         name,
                                         key,
@@ -1208,12 +1238,13 @@ async fn main() -> Result<()> {
                                         peer.stats.tx_bytes,
                                         allowed_ips
                                     );
+                                    }
+                                }
+                                Err(err) => {
+                                    eprintln!("wg status unavailable for {}: {}", iface, err);
                                 }
                             }
-                            Err(err) => {
-                                eprintln!("wg status unavailable for {}: {}", iface, err);
-                            }
-                        },
+                        }
                         Err(err) => {
                             eprintln!("invalid interface name {}: {}", iface, err);
                         }
@@ -1261,8 +1292,12 @@ async fn main() -> Result<()> {
                 },
             };
 
-            let client =
-                ControlClient::new(control_urls, tls_pin, state.node_token.clone(), admin_token)?;
+            let client = ControlClient::new(
+                control_urls.clone(),
+                tls_pin.clone(),
+                state.node_token.clone(),
+                admin_token,
+            )?;
             let response = client
                 .rotate_keys(&state.node_id, request)
                 .await
@@ -1358,7 +1393,9 @@ async fn main() -> Result<()> {
                 .wg_apply(&netmap, &state, &cfg, routes_cfg.as_ref())
                 .await?;
             if let Some(routes_cfg) = routes_cfg.as_ref() {
-                data_plane.apply_advertised_routes(&netmap, routes_cfg).await?;
+                data_plane
+                    .apply_advertised_routes(&netmap, routes_cfg)
+                    .await?;
             }
             if *probe_peers {
                 data_plane.wg_probe_peers(&netmap, *probe_timeout)?;
@@ -1411,7 +1448,10 @@ async fn main() -> Result<()> {
             relay_reprobe_after,
             dns_hosts_path,
             dns_serve,
+            dns_auto,
             dns_listen,
+            dns_mode,
+            dns_server,
             dns_apply_resolver,
             l2_relay,
             cleanup_before_start,
@@ -1436,7 +1476,32 @@ async fn main() -> Result<()> {
             if *relay_reprobe_after == 0 {
                 return Err(anyhow!("relay_reprobe_after must be > 0"));
             }
-            let resolver_integration_enabled = if *dns_apply_resolver {
+            let (dns_runtime_enabled, dns_apply_resolver_effective, dns_serve_auto_enabled) =
+                resolve_agent_dns_behavior(
+                    *dns_serve,
+                    *dns_apply_resolver,
+                    *dns_auto,
+                    dns_listen.as_deref(),
+                    dns_server,
+                );
+            let dns_mode_effective = if *dns_auto {
+                DnsMode::Hybrid
+            } else {
+                *dns_mode
+            };
+
+            if *dns_auto {
+                if *dns_mode != DnsMode::Hybrid {
+                    eprintln!("dns auto mode overrides --dns-mode to hybrid");
+                }
+                println!("dns auto mode enabled (hybrid dns + resolver integration)");
+            } else if dns_serve_auto_enabled {
+                println!(
+                    "dns options imply dns runtime; enabling dns server automatically (equivalent to --dns-serve)"
+                );
+            }
+
+            let resolver_integration_enabled = if dns_apply_resolver_effective {
                 match data_plane.capabilities().dns_resolver_integration {
                     platform::SupportLevel::Unsupported => {
                         eprintln!(
@@ -1490,14 +1555,21 @@ async fn main() -> Result<()> {
                 // Clean up the specific interface first
                 resource_guard::cleanup_existing_resources(Some(&iface)).await?;
                 // Then clean up all other ls-* interfaces (leftovers from crashes, etc.)
-                if let Err(e) = resource_guard::cleanup_all_lightscale_interfaces(Some(&iface)).await {
-                    eprintln!("pre-start: warning - failed to cleanup all interfaces: {}", e);
+                if let Err(e) =
+                    resource_guard::cleanup_all_lightscale_interfaces(Some(&iface)).await
+                {
+                    eprintln!(
+                        "pre-start: warning - failed to cleanup all interfaces: {}",
+                        e
+                    );
                 }
             }
 
             // Create resource guard for automatic cleanup on panic/unexpected exit
             let resource_guard = resource_guard::AsyncManagedResources::new();
-            resource_guard.set_interface(iface.clone(), (*backend).into()).await;
+            resource_guard
+                .set_interface(iface.clone(), (*backend).into())
+                .await;
             resource_guard.set_nftables_enabled(true).await;
             let admin_token = resolve_admin_token(&args);
             let profile = args.profile.clone();
@@ -1588,29 +1660,59 @@ async fn main() -> Result<()> {
             );
             let mut dns_state: Option<std::sync::Arc<std::sync::Mutex<model::NetMap>>> = None;
             let mut dns_listen_addr: Option<SocketAddr> = None;
+            let mut dns_resolver_ip: Option<IpAddr> = None;
+            let mut dns_servers: Vec<String> = Vec::new();
             let mut l2_state: Option<std::sync::Arc<std::sync::Mutex<model::NetMap>>> = None;
-            if *dns_serve {
-                let listen = dns_listen
-                    .clone()
-                    .unwrap_or_else(|| "127.0.0.1:53".to_string());
-                let listen_addr: SocketAddr =
-                    listen.parse().context("invalid dns listen address")?;
+            if dns_runtime_enabled {
                 let netmap =
                     ensure_netmap(&control_urls, tls_pin.clone(), &mut state, &state_path).await?;
-                dns_state = Some(data_plane.dns_spawn(listen_addr, netmap.clone())?);
-                dns_listen_addr = Some(listen_addr);
+                if matches!(dns_mode_effective, DnsMode::Server | DnsMode::Hybrid) {
+                    dns_servers = gather_dns_servers(
+                        &control_urls,
+                        tls_pin.clone(),
+                        &mut state,
+                        &state_path,
+                        dns_server,
+                    )
+                    .await?;
+                }
+                if dns_mode_effective != DnsMode::Server {
+                    let listen = dns_listen
+                        .clone()
+                        .unwrap_or_else(|| "127.0.0.1:53".to_string());
+                    let listen_addr: SocketAddr =
+                        listen.parse().context("invalid dns listen address")?;
+                    let upstream_servers = if dns_mode_effective == DnsMode::Hybrid {
+                        dns_servers.clone()
+                    } else {
+                        Vec::new()
+                    };
+                    dns_state = Some(data_plane.dns_spawn(
+                        listen_addr,
+                        netmap.clone(),
+                        upstream_servers,
+                    )?);
+                    dns_listen_addr = Some(listen_addr);
+                    println!("dns server listening on {}", listen_addr);
+                } else {
+                    println!(
+                        "dns server mode=server; using upstream dns {:?}",
+                        dns_servers
+                    );
+                }
                 if resolver_integration_enabled {
-                    if listen_addr.port() != 53 {
-                        eprintln!("dns listen port must be 53 to apply resolver");
-                    } else if let Err(err) = data_plane.dns_apply_resolver(
-                        &iface,
-                        &netmap.network.dns_domain,
-                        listen_addr.ip(),
-                    ) {
-                        eprintln!("failed to apply dns resolver: {}", err);
+                    dns_resolver_ip =
+                        resolve_dns_resolver_ip(dns_mode_effective, dns_listen_addr, &dns_servers)?;
+                    if let Some(target_ip) = dns_resolver_ip {
+                        if let Err(err) = data_plane.dns_apply_resolver(
+                            &iface,
+                            &netmap.network.dns_domain,
+                            target_ip,
+                        ) {
+                            eprintln!("failed to apply dns resolver: {}", err);
+                        }
                     }
                 }
-                println!("dns server listening on {}", listen_addr);
             }
             let startup_netmap = if let Some(netmap) = state.last_netmap.clone() {
                 netmap
@@ -1634,8 +1736,10 @@ async fn main() -> Result<()> {
             let mut last_revision = startup_netmap.revision;
 
             let mut interval = tokio::time::interval(Duration::from_secs(*heartbeat_interval));
-            let mut shutdown =
-                Box::pin(wait_for_shutdown_signal(matches!(*backend, WgBackend::Kernel)));
+            let mut shutdown = Box::pin(wait_for_shutdown_signal(matches!(
+                *backend,
+                WgBackend::Kernel
+            )));
             println!(
                 "agent running for node {} on network {}",
                 state.node_id, state.network_id
@@ -1702,15 +1806,13 @@ async fn main() -> Result<()> {
                                 }
                             }
                             if resolver_integration_enabled {
-                                if let Some(listen_addr) = dns_listen_addr.as_ref() {
-                                    if listen_addr.port() == 53 {
-                                        if let Err(err) = data_plane.dns_apply_resolver(
-                                            &iface,
-                                            &netmap.network.dns_domain,
-                                            listen_addr.ip(),
-                                        ) {
-                                            eprintln!("failed to apply dns resolver: {}", err);
-                                        }
+                                if let Some(target_ip) = dns_resolver_ip {
+                                    if let Err(err) = data_plane.dns_apply_resolver(
+                                        &iface,
+                                        &netmap.network.dns_domain,
+                                        target_ip,
+                                    ) {
+                                        eprintln!("failed to apply dns resolver: {}", err);
                                     }
                                 }
                             }
@@ -2058,7 +2160,10 @@ async fn main() -> Result<()> {
                     "feature.advanced_route_policy: {}",
                     data_plane_caps.advanced_route_policy.as_str()
                 );
-                println!("feature.router_mode: {}", data_plane_caps.router_mode.as_str());
+                println!(
+                    "feature.router_mode: {}",
+                    data_plane_caps.router_mode.as_str()
+                );
                 println!(
                     "feature.dns_local_server: {}",
                     data_plane_caps.dns_local_server.as_str()
@@ -2092,8 +2197,12 @@ async fn main() -> Result<()> {
                 .ok_or_else(|| anyhow!("state not found for profile {}", args.profile))?;
 
             let admin_token = resolve_admin_token(&args);
-            let client =
-                ControlClient::new(control_urls, tls_pin, state.node_token.clone(), admin_token)?;
+            let client = ControlClient::new(
+                control_urls.clone(),
+                tls_pin.clone(),
+                state.node_token.clone(),
+                admin_token,
+            )?;
             let netmap = client
                 .netmap(&state.node_id)
                 .await
@@ -2120,6 +2229,9 @@ async fn main() -> Result<()> {
         }
         Command::DnsServe {
             listen,
+            auto,
+            dns_mode,
+            dns_server,
             apply_resolver,
             interface,
         } => {
@@ -2131,8 +2243,12 @@ async fn main() -> Result<()> {
                 .ok_or_else(|| anyhow!("state not found for profile {}", args.profile))?;
 
             let admin_token = resolve_admin_token(&args);
-            let client =
-                ControlClient::new(control_urls, tls_pin, state.node_token.clone(), admin_token)?;
+            let client = ControlClient::new(
+                control_urls.clone(),
+                tls_pin.clone(),
+                state.node_token.clone(),
+                admin_token,
+            )?;
             let netmap = client
                 .netmap(&state.node_id)
                 .await
@@ -2142,23 +2258,75 @@ async fn main() -> Result<()> {
             state.updated_at = now_unix();
             save_state(&state_path, &state)?;
 
-            let listen_addr: SocketAddr = listen.parse().context("invalid listen address")?;
-            let _state = data_plane.dns_spawn(listen_addr, netmap.clone())?;
-            if *apply_resolver {
+            let dns_mode_effective = if *auto { DnsMode::Hybrid } else { *dns_mode };
+            if *auto {
+                if *dns_mode != DnsMode::Hybrid {
+                    eprintln!("dns auto mode overrides --dns-mode to hybrid");
+                }
+                println!("dns auto mode enabled (hybrid dns + resolver integration)");
+            }
+            let apply_resolver_effective = *apply_resolver || *auto;
+
+            let dns_servers = if matches!(dns_mode_effective, DnsMode::Server | DnsMode::Hybrid) {
+                gather_dns_servers(
+                    &control_urls,
+                    tls_pin.clone(),
+                    &mut state,
+                    &state_path,
+                    dns_server,
+                )
+                .await?
+            } else {
+                Vec::new()
+            };
+            let mut listen_addr: Option<SocketAddr> = None;
+            if dns_mode_effective != DnsMode::Server {
+                let parsed_listen_addr: SocketAddr =
+                    listen.parse().context("invalid listen address")?;
+                let upstream_servers = if dns_mode_effective == DnsMode::Hybrid {
+                    dns_servers.clone()
+                } else {
+                    Vec::new()
+                };
+                let _state =
+                    data_plane.dns_spawn(parsed_listen_addr, netmap.clone(), upstream_servers)?;
+                listen_addr = Some(parsed_listen_addr);
+                println!("dns server listening on {}", parsed_listen_addr);
+            } else {
+                println!(
+                    "dns server mode=server; using upstream dns {:?}",
+                    dns_servers
+                );
+            }
+            let mut resolver_target_ip: Option<IpAddr> = None;
+            if apply_resolver_effective {
                 data_plane::require_dns_resolver_integration(
                     data_plane.as_ref(),
                     "dns-serve --apply-resolver",
                 )?;
-                if listen_addr.port() != 53 {
-                    return Err(anyhow!("dns listen port must be 53 to apply resolver"));
-                }
+                resolver_target_ip =
+                    resolve_dns_resolver_ip(dns_mode_effective, listen_addr, &dns_servers)?;
                 let iface = interface
                     .clone()
                     .unwrap_or_else(|| default_interface_name(&args.profile));
-                data_plane.dns_apply_resolver(&iface, &netmap.network.dns_domain, listen_addr.ip())?;
+                if let Some(target_ip) = resolver_target_ip {
+                    data_plane.dns_apply_resolver(&iface, &netmap.network.dns_domain, target_ip)?;
+                }
             }
-            println!("dns server listening on {}", listen_addr);
+            if listen_addr.is_none() && !apply_resolver_effective {
+                return Ok(());
+            }
             tokio::signal::ctrl_c().await?;
+            if apply_resolver_effective {
+                let iface = interface
+                    .clone()
+                    .unwrap_or_else(|| default_interface_name(&args.profile));
+                if resolver_target_ip.is_some() {
+                    if let Err(err) = data_plane.dns_clear_resolver(&iface) {
+                        eprintln!("failed to clear dns resolver: {}", err);
+                    }
+                }
+            }
         }
         Command::Relay => {
             let config = load_optional_config(&args)?;
@@ -2482,7 +2650,10 @@ async fn run_daemon(
                     }
                 }
                 Err(err) => {
-                    eprintln!("failed to poll profile {} before stop: {}", profile.name, err);
+                    eprintln!(
+                        "failed to poll profile {} before stop: {}",
+                        profile.name, err
+                    );
                 }
             }
         }
@@ -2969,6 +3140,7 @@ fn print_relay_config(netmap: &model::NetMap) {
             "udp-relay: {}\n",
             relay.udp_relay_servers.join(", ")
         ));
+        output.push_str(&format!("dns-servers: {}\n", relay.dns_servers.join(", ")));
     } else {
         output.push_str("relay: none\n");
     }
@@ -3017,9 +3189,13 @@ async fn apply_netmap_update(
     }
 
     let wg_routes_cfg = if apply_routes { Some(routes_cfg) } else { None };
-    data_plane.wg_apply(&netmap, state, wg_cfg, wg_routes_cfg).await?;
+    data_plane
+        .wg_apply(&netmap, state, wg_cfg, wg_routes_cfg)
+        .await?;
     if apply_routes {
-        data_plane.apply_advertised_routes(&netmap, routes_cfg).await?;
+        data_plane
+            .apply_advertised_routes(&netmap, routes_cfg)
+            .await?;
     }
     if probe_peers {
         data_plane.wg_probe_peers(&netmap, probe_timeout)?;
@@ -3028,6 +3204,211 @@ async fn apply_netmap_update(
         apply_hosts_file(path, profile, &netmap)?;
     }
     Ok(())
+}
+
+async fn gather_dns_servers(
+    control_urls: &[String],
+    tls_pin: Option<String>,
+    state: &mut ClientState,
+    state_path: &PathBuf,
+    overrides: &[String],
+) -> Result<Vec<String>> {
+    if !overrides.is_empty() {
+        return normalize_dns_server_values(overrides.to_vec());
+    }
+
+    if let Some(netmap) = state.last_netmap.as_ref() {
+        if let Some(relay) = &netmap.relay {
+            if !relay.dns_servers.is_empty() {
+                return normalize_dns_server_values(relay.dns_servers.clone());
+            }
+        }
+    }
+
+    let netmap = ensure_netmap(control_urls, tls_pin, state, state_path).await?;
+    if let Some(relay) = netmap.relay {
+        if !relay.dns_servers.is_empty() {
+            return normalize_dns_server_values(relay.dns_servers);
+        }
+    }
+
+    derive_dns_servers_from_control_urls(control_urls)
+}
+
+fn resolve_agent_dns_behavior(
+    dns_serve: bool,
+    dns_apply_resolver: bool,
+    dns_auto: bool,
+    dns_listen: Option<&str>,
+    dns_server: &[String],
+) -> (bool, bool, bool) {
+    if dns_auto {
+        return (true, true, false);
+    }
+
+    let mut runtime_enabled = dns_serve;
+    let implicit_runtime =
+        !runtime_enabled && (dns_apply_resolver || dns_listen.is_some() || !dns_server.is_empty());
+    if implicit_runtime {
+        runtime_enabled = true;
+    }
+    (runtime_enabled, dns_apply_resolver, implicit_runtime)
+}
+
+fn normalize_dns_server_values(values: Vec<String>) -> Result<Vec<String>> {
+    let mut normalized = Vec::new();
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let (host, port) = parse_dns_server_endpoint(trimmed)?;
+        normalized.push(format_host_port(&host, port));
+    }
+    normalized.sort();
+    normalized.dedup();
+    Ok(normalized)
+}
+
+fn resolve_dns_resolver_ip(
+    mode: DnsMode,
+    listen_addr: Option<SocketAddr>,
+    dns_servers: &[String],
+) -> Result<Option<IpAddr>> {
+    match mode {
+        DnsMode::Local => {
+            let Some(listen_addr) = listen_addr else {
+                return Ok(None);
+            };
+            if listen_addr.port() != DEFAULT_DNS_PORT {
+                eprintln!("dns listen port must be 53 to apply resolver");
+                return Ok(None);
+            }
+            Ok(Some(listen_addr.ip()))
+        }
+        DnsMode::Server => {
+            let endpoint = dns_servers.first().ok_or_else(|| {
+                anyhow!("dns mode=server requires at least one dns server endpoint")
+            })?;
+            let (ip, port) = resolve_dns_server_ip(endpoint)?;
+            if port != DEFAULT_DNS_PORT {
+                return Err(anyhow!(
+                    "dns server endpoint {} must use port 53 for resolver apply",
+                    endpoint
+                ));
+            }
+            Ok(Some(ip))
+        }
+        DnsMode::Hybrid => {
+            if let Some(listen_addr) = listen_addr {
+                if listen_addr.port() == 53 {
+                    return Ok(Some(listen_addr.ip()));
+                }
+                eprintln!(
+                    "dns listen port {} cannot be used for resolver apply; attempting dns server fallback",
+                    listen_addr.port()
+                );
+            }
+            if let Some(endpoint) = dns_servers.first() {
+                let (ip, port) = resolve_dns_server_ip(endpoint)?;
+                if port == DEFAULT_DNS_PORT {
+                    eprintln!("using dns server fallback for resolver apply: {}", endpoint);
+                    return Ok(Some(ip));
+                }
+                eprintln!(
+                    "dns server fallback endpoint {} does not use port 53; resolver apply disabled",
+                    endpoint
+                );
+            }
+            Ok(None)
+        }
+    }
+}
+
+fn resolve_dns_server_ip(endpoint: &str) -> Result<(IpAddr, u16)> {
+    let (host, port) = parse_dns_server_endpoint(endpoint)?;
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok((ip, port));
+    }
+    let mut addrs = format_host_port(&host, port)
+        .to_socket_addrs()
+        .with_context(|| format!("failed to resolve dns server {}", endpoint))?;
+    let addr = addrs
+        .next()
+        .ok_or_else(|| anyhow!("failed to resolve dns server {}", endpoint))?;
+    Ok((addr.ip(), addr.port()))
+}
+
+const DEFAULT_DNS_PORT: u16 = 53;
+
+fn derive_dns_servers_from_control_urls(control_urls: &[String]) -> Result<Vec<String>> {
+    let mut values = Vec::new();
+    for control_url in control_urls {
+        if let Some(host) = extract_control_url_host(control_url) {
+            values.push(format_host_port(&host, DEFAULT_DNS_PORT));
+        }
+    }
+    normalize_dns_server_values(values)
+}
+
+fn extract_control_url_host(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    parsed.host_str().map(str::to_string)
+}
+
+fn parse_dns_server_endpoint(value: &str) -> Result<(String, u16)> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(anyhow!("invalid dns server endpoint: empty value"));
+    }
+    if let Some(stripped) = value.strip_prefix('[') {
+        let (host, rest) = stripped
+            .split_once(']')
+            .ok_or_else(|| anyhow!("invalid dns server endpoint {}: missing ']'", value))?;
+        if rest.is_empty() {
+            return Ok((host.to_string(), DEFAULT_DNS_PORT));
+        }
+        let port_raw = rest
+            .strip_prefix(':')
+            .ok_or_else(|| anyhow!("invalid dns server endpoint {}: missing port", value))?;
+        let port: u16 = port_raw
+            .parse()
+            .with_context(|| format!("invalid dns server endpoint {}: invalid port", value))?;
+        return Ok((host.to_string(), port));
+    }
+
+    if let Ok(ip) = value.parse::<IpAddr>() {
+        return Ok((ip.to_string(), DEFAULT_DNS_PORT));
+    }
+
+    if let Some((host, port_raw)) = value.rsplit_once(':') {
+        if host.is_empty() {
+            return Err(anyhow!(
+                "invalid dns server endpoint {}: missing host",
+                value
+            ));
+        }
+        if host.contains(':') {
+            return Err(anyhow!(
+                "invalid dns server endpoint {}: IPv6 addresses must be bracketed",
+                value
+            ));
+        }
+        let port: u16 = port_raw
+            .parse()
+            .with_context(|| format!("invalid dns server endpoint {}: invalid port", value))?;
+        return Ok((host.to_string(), port));
+    }
+
+    Ok((value.to_string(), DEFAULT_DNS_PORT))
+}
+
+fn format_host_port(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{}]:{}", host, port)
+    } else {
+        format!("{}:{}", host, port)
+    }
 }
 
 async fn gather_stun_servers(
@@ -3387,7 +3768,11 @@ fn print_return_route_guidance(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_admin_login_approval_url, resolve_machine_keys, resolve_wg_keys};
+    use super::{
+        build_admin_login_approval_url, derive_dns_servers_from_control_urls,
+        normalize_dns_server_values, parse_dns_server_endpoint, resolve_agent_dns_behavior,
+        resolve_machine_keys, resolve_wg_keys,
+    };
     use anyhow::Result;
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
@@ -3405,7 +3790,8 @@ mod tests {
         let parsed = url::Url::parse(&url)?;
         assert_eq!(parsed.scheme(), "https");
         assert_eq!(parsed.host_str(), Some("admin.example.com"));
-        let params: std::collections::HashMap<String, String> = parsed.query_pairs().into_owned().collect();
+        let params: std::collections::HashMap<String, String> =
+            parsed.query_pairs().into_owned().collect();
         assert_eq!(params.get("ls_join"), Some(&"1".to_string()));
         assert_eq!(params.get("network_id"), Some(&"net-123".to_string()));
         assert_eq!(
@@ -3463,11 +3849,75 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn parse_dns_server_endpoint_defaults_port_to_53() -> Result<()> {
+        let endpoint = parse_dns_server_endpoint("dns.example.com")?;
+        assert_eq!(endpoint, ("dns.example.com".to_string(), 53));
+        let endpoint_v6 = parse_dns_server_endpoint("[2001:db8::10]")?;
+        assert_eq!(endpoint_v6, ("2001:db8::10".to_string(), 53));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_dns_server_endpoint_rejects_invalid_unbracketed_ipv6_with_port_like_suffix() {
+        let result = parse_dns_server_endpoint("2001:db8::10:70000");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn normalize_dns_server_values_deduplicates_and_normalizes() -> Result<()> {
+        let values = normalize_dns_server_values(vec![
+            "dns.example.com".to_string(),
+            "dns.example.com:53".to_string(),
+            "[2001:db8::1]".to_string(),
+            "[2001:db8::1]:53".to_string(),
+        ])?;
+        assert_eq!(
+            values,
+            vec![
+                "[2001:db8::1]:53".to_string(),
+                "dns.example.com:53".to_string()
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn derive_dns_servers_from_control_urls_defaults_to_53() -> Result<()> {
+        let values = derive_dns_servers_from_control_urls(&[
+            "https://control.example.com".to_string(),
+            "https://[2001:db8::10]:8443".to_string(),
+        ])?;
+        assert_eq!(
+            values,
+            vec![
+                "[2001:db8::10]:53".to_string(),
+                "control.example.com:53".to_string()
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_agent_dns_behavior_enables_runtime_when_dns_options_present() {
+        let (runtime, apply, implicit) =
+            resolve_agent_dns_behavior(false, false, false, Some("127.0.0.1:53"), &[]);
+        assert!(runtime);
+        assert!(!apply);
+        assert!(implicit);
+    }
+
+    #[test]
+    fn resolve_agent_dns_behavior_dns_auto_enables_runtime_and_resolver() {
+        let (runtime, apply, implicit) = resolve_agent_dns_behavior(false, false, true, None, &[]);
+        assert!(runtime);
+        assert!(apply);
+        assert!(!implicit);
+    }
+
     fn write_temp_key_file(prefix: &str, private: &str) -> Result<PathBuf> {
         let mut path = std::env::temp_dir();
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_nanos();
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         path.push(format!("lightscale-{}-{}.key", prefix, nonce));
         std::fs::write(&path, private)?;
         Ok(path)

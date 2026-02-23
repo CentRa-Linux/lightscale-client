@@ -4,15 +4,21 @@ use hickory_proto::op::{Message, MessageType, ResponseCode};
 use hickory_proto::rr::rdata::{A, AAAA};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use std::net::{IpAddr, SocketAddr};
+#[cfg(target_os = "macos")]
+use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::net::UdpSocket;
+#[cfg(target_os = "windows")]
+use {
+    defguard_wireguard_rs::{Kernel, WGApi, WireguardInterfaceApi},
+    std::process::Command,
+};
 #[cfg(target_os = "linux")]
 use {
     std::ffi::CString,
     zbus::blocking::{Connection, Proxy},
 };
-#[cfg(target_os = "macos")]
-use std::path::Path;
 
 #[cfg(target_os = "macos")]
 const MACOS_RESOLVER_DIR: &str = "/etc/resolver";
@@ -22,19 +28,29 @@ const MACOS_MANAGED_MARKER: &str = "# managed-by: lightscale-client";
 const MACOS_INTERFACE_MARKER_PREFIX: &str = "# interface: ";
 
 const DNS_TTL_SECONDS: u32 = 30;
+const DNS_UPSTREAM_TIMEOUT: Duration = Duration::from_millis(1200);
+const DNS_UPSTREAM_BUFFER_SIZE: usize = 2048;
 
-pub fn spawn(addr: SocketAddr, netmap: NetMap) -> Result<Arc<Mutex<NetMap>>> {
+pub fn spawn(
+    addr: SocketAddr,
+    netmap: NetMap,
+    upstream_servers: Vec<String>,
+) -> Result<Arc<Mutex<NetMap>>> {
     let state = Arc::new(Mutex::new(netmap));
     let state_task = Arc::clone(&state);
     tokio::spawn(async move {
-        if let Err(err) = serve(addr, state_task).await {
+        if let Err(err) = serve(addr, state_task, upstream_servers).await {
             eprintln!("dns server stopped: {}", err);
         }
     });
     Ok(state)
 }
 
-pub async fn serve(addr: SocketAddr, state: Arc<Mutex<NetMap>>) -> Result<()> {
+pub async fn serve(
+    addr: SocketAddr,
+    state: Arc<Mutex<NetMap>>,
+    upstream_servers: Vec<String>,
+) -> Result<()> {
     let socket = UdpSocket::bind(addr)
         .await
         .with_context(|| format!("dns listen {} failed", addr))?;
@@ -45,10 +61,47 @@ pub async fn serve(addr: SocketAddr, state: Arc<Mutex<NetMap>>) -> Result<()> {
             Ok(msg) => msg,
             Err(_) => continue,
         };
-        let response = build_response(&request, &state)?;
+        let mut response = build_response(&request, &state)?;
+        if !upstream_servers.is_empty()
+            && matches!(
+                response.response_code(),
+                ResponseCode::NXDomain | ResponseCode::Refused
+            )
+        {
+            if let Some(upstream_response) =
+                query_upstream(&request, &upstream_servers, addr.is_ipv4()).await
+            {
+                response = upstream_response;
+            }
+        }
         let out = response.to_vec()?;
         let _ = socket.send_to(&out, peer).await;
     }
+}
+
+async fn query_upstream(
+    request: &Message,
+    upstream_servers: &[String],
+    prefer_ipv4: bool,
+) -> Option<Message> {
+    let query = request.to_vec().ok()?;
+    let bind_addr = if prefer_ipv4 { "0.0.0.0:0" } else { "[::]:0" };
+    let socket = UdpSocket::bind(bind_addr).await.ok()?;
+    let mut buf = vec![0u8; DNS_UPSTREAM_BUFFER_SIZE];
+    for upstream in upstream_servers {
+        if socket.send_to(&query, upstream).await.is_err() {
+            continue;
+        }
+        let Ok(Ok((len, _peer))) =
+            tokio::time::timeout(DNS_UPSTREAM_TIMEOUT, socket.recv_from(&mut buf)).await
+        else {
+            continue;
+        };
+        if let Ok(response) = Message::from_vec(&buf[..len]) {
+            return Some(response);
+        }
+    }
+    None
 }
 
 pub fn apply_resolver(interface: &str, domain: &str, server: IpAddr) -> Result<()> {
@@ -60,7 +113,11 @@ pub fn apply_resolver(interface: &str, domain: &str, server: IpAddr) -> Result<(
     {
         apply_resolver_macos(interface, domain, server)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    {
+        apply_resolver_windows(interface, domain, server)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = (interface, domain, server);
         Err(anyhow!(
@@ -78,7 +135,11 @@ pub fn clear_resolver(interface: &str) -> Result<()> {
     {
         clear_resolver_macos(interface)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    {
+        clear_resolver_windows(interface)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = interface;
         Err(anyhow!(
@@ -135,8 +196,8 @@ fn clear_resolver_resolved(interface: &str) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn interface_index(interface: &str) -> Result<i32> {
-    let c_name =
-        CString::new(interface).map_err(|_| anyhow!("interface name contains invalid null byte"))?;
+    let c_name = CString::new(interface)
+        .map_err(|_| anyhow!("interface name contains invalid null byte"))?;
     let idx = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
     if idx == 0 {
         return Err(anyhow!(
@@ -182,7 +243,11 @@ fn clear_resolver_macos(interface: &str) -> Result<()> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err).context("failed to list /etc/resolver"),
     };
-    let interface_marker = format!("{prefix}{iface}", prefix = MACOS_INTERFACE_MARKER_PREFIX, iface = interface);
+    let interface_marker = format!(
+        "{prefix}{iface}",
+        prefix = MACOS_INTERFACE_MARKER_PREFIX,
+        iface = interface
+    );
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
@@ -195,9 +260,7 @@ fn clear_resolver_macos(interface: &str) -> Result<()> {
         let has_managed_marker = content
             .lines()
             .any(|line| line.trim() == MACOS_MANAGED_MARKER);
-        let has_interface_marker = content
-            .lines()
-            .any(|line| line.trim() == interface_marker);
+        let has_interface_marker = content.lines().any(|line| line.trim() == interface_marker);
         if has_managed_marker && has_interface_marker {
             std::fs::remove_file(&path)
                 .with_context(|| format!("failed to remove resolver file {}", path.display()))?;
@@ -216,6 +279,46 @@ fn normalize_macos_domain(domain: &str) -> Result<String> {
         return Err(anyhow!("dns domain contains invalid path separator"));
     }
     Ok(domain)
+}
+
+#[cfg(target_os = "windows")]
+fn apply_resolver_windows(interface: &str, domain: &str, server: IpAddr) -> Result<()> {
+    let mut api = WGApi::<Kernel>::new(interface.to_string())
+        .context("failed to initialize Windows WireGuard API")?;
+    api.create_interface()
+        .context("failed to open/create Windows WireGuard adapter")?;
+
+    let domain = domain.trim().trim_end_matches('.');
+    let search_domains: Vec<&str> = if domain.is_empty() {
+        Vec::new()
+    } else {
+        vec![domain]
+    };
+    api.configure_dns(&[server], &search_domains)
+        .context("failed to configure Windows DNS resolver")?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn clear_resolver_windows(interface: &str) -> Result<()> {
+    let escaped_interface = interface.replace('\'', "''");
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'; Set-DnsClientServerAddress -InterfaceAlias '{iface}' -ResetServerAddresses | Out-Null",
+        iface = escaped_interface
+    );
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .context("failed to invoke powershell for DNS resolver reset")?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(anyhow!(
+        "failed to clear Windows DNS resolver for interface {}: {}",
+        interface,
+        stderr.trim()
+    ))
 }
 
 fn build_response(request: &Message, state: &Arc<Mutex<NetMap>>) -> Result<Message> {

@@ -1,6 +1,6 @@
+use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use std::path::Path;

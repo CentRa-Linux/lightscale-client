@@ -202,7 +202,9 @@ For detailed feature gates (routes/resolver/daemon/service), check
 On non-Linux platforms:
 - advertised route programming is currently partial (WireGuard peer routing based)
 - advanced policy route controls (`--route-table`, `--exit-node-uid-range`) are Linux-only
-- resolver integration is currently implemented on Linux and macOS
+- resolver integration is implemented on Linux/macOS and available as best-effort on Windows
+- endpoint refresh / relay reprobe is implemented on Linux/macOS and available as best-effort on
+  Windows via adapter reconfiguration
 
 Official support tiers (Linux full client, desktop control-plane tier, mobile
 integration contract) are documented in `../docs/platform-support.md`.
@@ -537,6 +539,40 @@ Show relay configuration (STUN/TURN/stream relay/UDP relay):
 ```sh
 cargo run -- --profile default relay
 ```
+
+Run local DNS in hybrid mode (local authoritative + upstream fallback from netmap DNS servers):
+
+```sh
+sudo cargo run -- --profile default dns-serve --dns-mode hybrid --apply-resolver
+```
+
+Run recommended DNS setup with one flag:
+
+```sh
+sudo cargo run -- --profile default dns-serve --auto
+```
+
+Run server-only DNS mode (no local listener, resolver points to advertised/derived server DNS):
+
+```sh
+sudo cargo run -- --profile default dns-serve --dns-mode server --apply-resolver
+```
+
+Use hybrid DNS with `agent`:
+
+```sh
+sudo cargo run -- --profile default agent --dns-serve --dns-mode hybrid --dns-apply-resolver
+```
+
+Use one-flag recommended DNS setup with `agent`:
+
+```sh
+sudo cargo run -- --profile default agent --dns-auto
+```
+
+`--dns-server` values accept `HOST` or `HOST:PORT` (port omitted => `53`). In `server`/`hybrid`
+mode, client DNS upstreams are taken from netmap relay settings first; if absent, control URL hosts
+are used as fallback DNS endpoints on port `53`.
 
 ## UDP relay (best effort)
 

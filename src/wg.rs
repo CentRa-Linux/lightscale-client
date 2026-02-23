@@ -74,7 +74,7 @@ pub async fn remove(interface: &str, backend: Backend) -> Result<()> {
             INTERFACE_PREFIX
         ));
     }
-    
+
     let netlink = Netlink::new().await?;
     match backend {
         Backend::Kernel => {
