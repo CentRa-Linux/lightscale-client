@@ -45,10 +45,10 @@ pub fn current() -> PlatformProfile {
             os,
             arch,
             control_plane: SupportLevel::Partial,
-            data_plane: SupportLevel::Unsupported,
+            data_plane: SupportLevel::Partial,
             service_integration: SupportLevel::Unsupported,
             service_managers: &["none"],
-            note: "control-plane commands are expected to work; data-plane and service management are linux-only today",
+            note: "control-plane commands are expected to work; non-linux data-plane support is experimental",
         },
         _ => PlatformProfile {
             os,
@@ -66,6 +66,10 @@ pub fn require_linux_data_plane(command_name: &str) -> Result<()> {
     require_data_plane_for(current(), command_name)
 }
 
+pub fn require_data_plane(command_name: &str) -> Result<()> {
+    require_any_data_plane_for(current(), command_name)
+}
+
 pub fn require_linux_service_integration(command_name: &str) -> Result<()> {
     require_service_integration_for(current(), command_name)
 }
@@ -76,6 +80,18 @@ fn require_data_plane_for(profile: PlatformProfile, command_name: &str) -> Resul
     }
     Err(anyhow!(
         "{} is only supported on linux (host: {}-{}); use control-plane commands (init/register/netmap/status) on this platform",
+        command_name,
+        profile.os,
+        profile.arch
+    ))
+}
+
+fn require_any_data_plane_for(profile: PlatformProfile, command_name: &str) -> Result<()> {
+    if profile.data_plane != SupportLevel::Unsupported {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "{} data-plane is unsupported on host: {}-{}; use control-plane commands (init/register/netmap/status) on this platform",
         command_name,
         profile.os,
         profile.arch
@@ -97,8 +113,8 @@ fn require_service_integration_for(profile: PlatformProfile, command_name: &str)
 #[cfg(test)]
 mod tests {
     use super::{
-        current, require_data_plane_for, require_service_integration_for, PlatformProfile,
-        SupportLevel,
+        current, require_any_data_plane_for, require_data_plane_for,
+        require_service_integration_for, PlatformProfile, SupportLevel,
     };
 
     fn partial_profile() -> PlatformProfile {
@@ -110,6 +126,18 @@ mod tests {
             service_integration: SupportLevel::Unsupported,
             service_managers: &["none"],
             note: "control-plane only",
+        }
+    }
+
+    fn experimental_data_plane_profile() -> PlatformProfile {
+        PlatformProfile {
+            os: "macos",
+            arch: "x86_64",
+            control_plane: SupportLevel::Partial,
+            data_plane: SupportLevel::Partial,
+            service_integration: SupportLevel::Unsupported,
+            service_managers: &["none"],
+            note: "experimental data-plane",
         }
     }
 
@@ -145,5 +173,11 @@ mod tests {
         let text = format!("{}", err);
         assert!(text.contains("dns-serve --apply-resolver"));
         assert!(text.contains("service integration is only supported on linux"));
+    }
+
+    #[test]
+    fn partial_data_plane_is_accepted_for_experimental_platforms() {
+        require_any_data_plane_for(experimental_data_plane_profile(), "wg-up")
+            .expect("partial data-plane support should pass generic data-plane requirement");
     }
 }

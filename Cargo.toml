@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1"
+async-trait = "0.1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 dirs = "5"
@@ -39,3 +40,6 @@ rtnetlink = "0.20"
 netlink-packet-route = "0.28"
 wireguard-control = "1.7"
 boringtun = { version = "0.7", features = ["device"] }
+
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+defguard_wireguard_rs = "0.9"

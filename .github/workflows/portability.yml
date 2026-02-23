@@ -48,11 +48,16 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cargo check portability layer (macOS)
-        run: cargo check --lib
+      - name: Cargo check binary (macOS)
+        run: cargo check --bin lightscale-client
 
       - name: Platform guard tests (macOS)
         run: cargo test --lib platform::tests
+
+      - name: Platform command smoke (macOS)
+        run: |
+          cargo run -- platform --json > /tmp/platform-macos.json
+          grep -q '"os": "macos"' /tmp/platform-macos.json
 
   windows-platform:
     runs-on: windows-2022
@@ -64,8 +69,13 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cargo check portability layer (Windows)
-        run: cargo check --lib
+      - name: Cargo check binary (Windows)
+        run: cargo check --bin lightscale-client
 
       - name: Platform guard tests (Windows)
         run: cargo test --lib platform::tests
+
+      - name: Platform command smoke (Windows)
+        run: |
+          cargo run -- platform --json | Out-File -FilePath $env:TEMP\platform-windows.json
+          Select-String -Path $env:TEMP\platform-windows.json -Pattern '"os": "windows"'

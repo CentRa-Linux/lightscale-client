@@ -1,5 +1,6 @@
 mod config;
 mod control;
+mod data_plane;
 mod dns_server;
 mod firewall;
 mod keys;
@@ -16,6 +17,10 @@ mod stream_relay;
 mod stun;
 mod turn;
 mod udp_relay;
+#[cfg(target_os = "linux")]
+mod wg;
+#[cfg(not(target_os = "linux"))]
+#[path = "wg_portable.rs"]
 mod wg;
 
 use anyhow::{anyhow, Context, Result};
@@ -536,6 +541,7 @@ enum AdminKeysCommand {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    let data_plane = data_plane::for_current_platform();
 
     match &args.command {
         Command::Init { control_url } => {
@@ -1147,65 +1153,73 @@ async fn main() -> Result<()> {
                 println!("peers: {}", netmap.peers.len());
             }
             if *wg {
-                let iface = interface
-                    .clone()
-                    .unwrap_or_else(|| default_interface_name(&args.profile));
-                let backend = match backend {
-                    WgBackend::Kernel => wireguard_control::Backend::Kernel,
-                    WgBackend::Boringtun => wireguard_control::Backend::Userspace,
-                };
-                match iface.parse::<wireguard_control::InterfaceName>() {
-                    Ok(iface_name) => match wireguard_control::Device::get(&iface_name, backend) {
-                        Ok(device) => {
-                            println!("wg interface: {}", iface);
-                            let mut peers_by_key = HashMap::new();
-                            if let Some(netmap) = state.last_netmap.as_ref() {
-                                for peer in &netmap.peers {
-                                    peers_by_key.insert(peer.wg_public_key.clone(), peer);
+                #[cfg(target_os = "linux")]
+                {
+                    let iface = interface
+                        .clone()
+                        .unwrap_or_else(|| default_interface_name(&args.profile));
+                    let backend = match backend {
+                        WgBackend::Kernel => wireguard_control::Backend::Kernel,
+                        WgBackend::Boringtun => wireguard_control::Backend::Userspace,
+                    };
+                    match iface.parse::<wireguard_control::InterfaceName>() {
+                        Ok(iface_name) => match wireguard_control::Device::get(&iface_name, backend) {
+                            Ok(device) => {
+                                println!("wg interface: {}", iface);
+                                let mut peers_by_key = HashMap::new();
+                                if let Some(netmap) = state.last_netmap.as_ref() {
+                                    for peer in &netmap.peers {
+                                        peers_by_key.insert(peer.wg_public_key.clone(), peer);
+                                    }
+                                }
+                                for peer in device.peers {
+                                    let key = peer.config.public_key.to_base64();
+                                    let name = peers_by_key
+                                        .get(&key)
+                                        .map(|peer| peer.name.as_str())
+                                        .unwrap_or("<unknown>");
+                                    let endpoint = peer
+                                        .config
+                                        .endpoint
+                                        .map(|ep| ep.to_string())
+                                        .unwrap_or_else(|| "none".to_string());
+                                    let handshake =
+                                        format_handshake_age(peer.stats.last_handshake_time);
+                                    let allowed_ips = if peer.config.allowed_ips.is_empty() {
+                                        "none".to_string()
+                                    } else {
+                                        peer.config
+                                            .allowed_ips
+                                            .iter()
+                                            .map(|ip| format!("{}/{}", ip.address, ip.cidr))
+                                            .collect::<Vec<_>>()
+                                            .join(",")
+                                    };
+                                    println!(
+                                        "peer {} {} handshake={} endpoint={} rx={} tx={} allowed_ips={}",
+                                        name,
+                                        key,
+                                        handshake,
+                                        endpoint,
+                                        peer.stats.rx_bytes,
+                                        peer.stats.tx_bytes,
+                                        allowed_ips
+                                    );
                                 }
                             }
-                            for peer in device.peers {
-                                let key = peer.config.public_key.to_base64();
-                                let name = peers_by_key
-                                    .get(&key)
-                                    .map(|peer| peer.name.as_str())
-                                    .unwrap_or("<unknown>");
-                                let endpoint = peer
-                                    .config
-                                    .endpoint
-                                    .map(|ep| ep.to_string())
-                                    .unwrap_or_else(|| "none".to_string());
-                                let handshake =
-                                    format_handshake_age(peer.stats.last_handshake_time);
-                                let allowed_ips = if peer.config.allowed_ips.is_empty() {
-                                    "none".to_string()
-                                } else {
-                                    peer.config
-                                        .allowed_ips
-                                        .iter()
-                                        .map(|ip| format!("{}/{}", ip.address, ip.cidr))
-                                        .collect::<Vec<_>>()
-                                        .join(",")
-                                };
-                                println!(
-                                    "peer {} {} handshake={} endpoint={} rx={} tx={} allowed_ips={}",
-                                    name,
-                                    key,
-                                    handshake,
-                                    endpoint,
-                                    peer.stats.rx_bytes,
-                                    peer.stats.tx_bytes,
-                                    allowed_ips
-                                );
+                            Err(err) => {
+                                eprintln!("wg status unavailable for {}: {}", iface, err);
                             }
-                        }
+                        },
                         Err(err) => {
-                            eprintln!("wg status unavailable for {}: {}", iface, err);
+                            eprintln!("invalid interface name {}: {}", iface, err);
                         }
-                    },
-                    Err(err) => {
-                        eprintln!("invalid interface name {}: {}", iface, err);
                     }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = backend;
+                    eprintln!("status --wg is only available on linux");
                 }
             }
         }
@@ -1281,7 +1295,7 @@ async fn main() -> Result<()> {
             probe_peers,
             probe_timeout,
         } => {
-            platform::require_linux_data_plane("wg-up")?;
+            platform::require_data_plane("wg-up")?;
             let config = load_optional_config(&args)?;
             let control_urls = resolve_control_urls(&args, config.as_ref())?;
             let tls_pin = resolve_tls_pin(&args, &config);
@@ -1334,25 +1348,28 @@ async fn main() -> Result<()> {
             } else {
                 None
             };
-            wg::apply(&netmap, &state, &cfg, routes_cfg.as_ref()).await?;
+            data_plane
+                .wg_apply(&netmap, &state, &cfg, routes_cfg.as_ref())
+                .await?;
             if let Some(routes_cfg) = routes_cfg.as_ref() {
-                routes::apply_advertised_routes(&netmap, routes_cfg).await?;
+                data_plane.apply_advertised_routes(&netmap, routes_cfg).await?;
             }
             if *probe_peers {
-                wg::probe_peers(&netmap, *probe_timeout)?;
+                data_plane.wg_probe_peers(&netmap, *probe_timeout)?;
             }
             println!("configured wireguard interface {}", iface);
+            #[cfg(target_os = "linux")]
             if matches!(*backend, WgBackend::Boringtun) {
                 println!("boringtun backend running in foreground; press Ctrl+C to stop");
                 tokio::signal::ctrl_c().await?;
             }
         }
         Command::WgDown { interface, backend } => {
-            platform::require_linux_data_plane("wg-down")?;
+            platform::require_data_plane("wg-down")?;
             let iface = interface
                 .clone()
                 .unwrap_or_else(|| default_interface_name(&args.profile));
-            wg::remove(&iface, (*backend).into()).await?;
+            data_plane.wg_remove(&iface, (*backend).into()).await?;
             println!("removed wireguard interface {}", iface);
         }
         Command::Agent {
@@ -1394,7 +1411,7 @@ async fn main() -> Result<()> {
             cleanup_before_start,
             pid_file,
         } => {
-            platform::require_linux_data_plane("agent")?;
+            platform::require_data_plane("agent")?;
             if *heartbeat_interval == 0 {
                 return Err(anyhow!("heartbeat_interval must be > 0"));
             }
@@ -1558,12 +1575,12 @@ async fn main() -> Result<()> {
                     listen.parse().context("invalid dns listen address")?;
                 let netmap =
                     ensure_netmap(&control_urls, tls_pin.clone(), &mut state, &state_path).await?;
-                dns_state = Some(dns_server::spawn(listen_addr, netmap.clone())?);
+                dns_state = Some(data_plane.dns_spawn(listen_addr, netmap.clone())?);
                 dns_listen_addr = Some(listen_addr);
                 if *dns_apply_resolver {
                     if listen_addr.port() != 53 {
                         eprintln!("dns listen port must be 53 to apply resolver");
-                    } else if let Err(err) = dns_server::apply_resolver(
+                    } else if let Err(err) = data_plane.dns_apply_resolver(
                         &iface,
                         &netmap.network.dns_domain,
                         listen_addr.ip(),
@@ -1579,6 +1596,7 @@ async fn main() -> Result<()> {
                 ensure_netmap(&control_urls, tls_pin.clone(), &mut state, &state_path).await?
             };
             apply_netmap_update(
+                data_plane.as_ref(),
                 &state_path,
                 &mut state,
                 startup_netmap.clone(),
@@ -1643,6 +1661,7 @@ async fn main() -> Result<()> {
                         if netmap.revision > last_revision {
                             last_revision = netmap.revision;
                             apply_netmap_update(
+                                data_plane.as_ref(),
                                 &state_path,
                                 &mut state,
                                 netmap.clone(),
@@ -1663,7 +1682,7 @@ async fn main() -> Result<()> {
                             if *dns_apply_resolver {
                                 if let Some(listen_addr) = dns_listen_addr.as_ref() {
                                     if listen_addr.port() == 53 {
-                                        if let Err(err) = dns_server::apply_resolver(
+                                        if let Err(err) = data_plane.dns_apply_resolver(
                                             &iface,
                                             &netmap.network.dns_domain,
                                             listen_addr.ip(),
@@ -1709,7 +1728,7 @@ async fn main() -> Result<()> {
                         } else {
                             HashMap::new()
                         };
-                        if let Err(err) = wg::refresh_peer_endpoints(
+                        if let Err(err) = data_plane.wg_refresh_peer_endpoints(
                             &netmap,
                             &wg_cfg,
                             &mut endpoint_tracker,
@@ -1736,6 +1755,7 @@ async fn main() -> Result<()> {
                         if netmap.revision > last_revision {
                             last_revision = netmap.revision;
                             apply_netmap_update(
+                                data_plane.as_ref(),
                                 &state_path,
                                 &mut state,
                                 netmap.clone(),
@@ -1760,7 +1780,7 @@ async fn main() -> Result<()> {
                         } else {
                             HashMap::new()
                         };
-                        if let Err(err) = wg::refresh_peer_endpoints(
+                        if let Err(err) = data_plane.wg_refresh_peer_endpoints(
                             &netmap,
                             &wg_cfg,
                             &mut endpoint_tracker,
@@ -1776,13 +1796,13 @@ async fn main() -> Result<()> {
             }
 
             if *dns_apply_resolver {
-                if let Err(err) = dns_server::clear_resolver(&iface) {
+                if let Err(err) = data_plane.dns_clear_resolver(&iface) {
                     eprintln!("failed to clear dns resolver: {}", err);
                 }
             }
             // Disable automatic cleanup since we're doing clean shutdown
             resource_guard.disable_cleanup().await;
-            if let Err(err) = wg::remove(&iface, (*backend).into()).await {
+            if let Err(err) = data_plane.wg_remove(&iface, (*backend).into()).await {
                 eprintln!("wireguard cleanup failed: {}", err);
             }
             println!("agent stopped");
@@ -2059,7 +2079,7 @@ async fn main() -> Result<()> {
             save_state(&state_path, &state)?;
 
             let listen_addr: SocketAddr = listen.parse().context("invalid listen address")?;
-            let _state = dns_server::spawn(listen_addr, netmap.clone())?;
+            let _state = data_plane.dns_spawn(listen_addr, netmap.clone())?;
             if *apply_resolver {
                 platform::require_linux_service_integration("dns-serve --apply-resolver")?;
                 if listen_addr.port() != 53 {
@@ -2068,7 +2088,7 @@ async fn main() -> Result<()> {
                 let iface = interface
                     .clone()
                     .unwrap_or_else(|| default_interface_name(&args.profile));
-                dns_server::apply_resolver(&iface, &netmap.network.dns_domain, listen_addr.ip())?;
+                data_plane.dns_apply_resolver(&iface, &netmap.network.dns_domain, listen_addr.ip())?;
             }
             println!("dns server listening on {}", listen_addr);
             tokio::signal::ctrl_c().await?;
@@ -2898,6 +2918,7 @@ fn write_stdout_best_effort(text: &str) {
 }
 
 async fn apply_netmap_update(
+    data_plane: &dyn data_plane::DataPlane,
     state_path: &PathBuf,
     state: &mut ClientState,
     netmap: model::NetMap,
@@ -2929,12 +2950,12 @@ async fn apply_netmap_update(
     }
 
     let wg_routes_cfg = if apply_routes { Some(routes_cfg) } else { None };
-    wg::apply(&netmap, state, wg_cfg, wg_routes_cfg).await?;
+    data_plane.wg_apply(&netmap, state, wg_cfg, wg_routes_cfg).await?;
     if apply_routes {
-        routes::apply_advertised_routes(&netmap, routes_cfg).await?;
+        data_plane.apply_advertised_routes(&netmap, routes_cfg).await?;
     }
     if probe_peers {
-        wg::probe_peers(&netmap, probe_timeout)?;
+        data_plane.wg_probe_peers(&netmap, probe_timeout)?;
     }
     if let Some(path) = dns_hosts_path {
         apply_hosts_file(path, profile, &netmap)?;

@@ -182,19 +182,35 @@ JSON output (for automation/CI checks):
 cargo run -- platform --json
 ```
 
-`wg-up`, `wg-down`, `agent`, `daemon`, and `router` are explicitly guarded as
-Linux-only data-plane commands.
+`status --wg`, `daemon`, and `router` are Linux-only.
+`wg-up`, `wg-down`, and `agent` use the cross-platform data-plane abstraction:
+- Linux: native netlink + nftables path (primary supported path)
+- macOS: experimental userspace WireGuard path
+- Windows: experimental kernel adapter path (WireGuardNT-based)
+
+For non-Linux hosts, prefer starting with:
+
+```sh
+cargo run -- platform --json
+```
+
+and verify `"data_plane"` support before running `wg-up`/`agent`.
 
 Official support tiers (Linux full client, desktop control-plane tier, mobile
 integration contract) are documented in `../docs/platform-support.md`.
 
-## Configure WireGuard (Linux)
+## Configure WireGuard Data Plane
 
 Bring up an interface using the latest netmap:
 
 ```sh
 sudo cargo run -- --profile default wg-up --listen-port 51820
 ```
+
+On non-Linux hosts this command is experimental.
+- macOS uses userspace WireGuard backend.
+- Windows uses a WireGuardNT adapter backend and requires a usable `wireguard.dll`
+  (the backend defaults to `resources-windows/binaries/wireguard.dll`).
 
 Use boringtun (userspace WireGuard) instead of the kernel module:
 
