@@ -10,6 +10,8 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+#[cfg(not(target_os = "linux"))]
+use std::sync::Once;
 
 #[derive(Debug, Clone, Copy)]
 pub struct DataPlaneCapabilities {
@@ -32,15 +34,37 @@ const LINUX_CAPABILITIES: DataPlaneCapabilities = DataPlaneCapabilities {
     note: "linux backend: full data-plane with route/dns/service integration",
 };
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 const PORTABLE_CAPABILITIES: DataPlaneCapabilities = DataPlaneCapabilities {
     wireguard: SupportLevel::Partial,
+    advertised_routes: SupportLevel::Partial,
+    advanced_route_policy: SupportLevel::Unsupported,
+    router_mode: SupportLevel::Unsupported,
+    dns_local_server: SupportLevel::Supported,
+    dns_resolver_integration: SupportLevel::Partial,
+    note: "macOS backend: experimental wireguard and resolver integration; advanced policy routing/service integration pending",
+};
+
+#[cfg(target_os = "windows")]
+const PORTABLE_CAPABILITIES: DataPlaneCapabilities = DataPlaneCapabilities {
+    wireguard: SupportLevel::Partial,
+    advertised_routes: SupportLevel::Partial,
+    advanced_route_policy: SupportLevel::Unsupported,
+    router_mode: SupportLevel::Unsupported,
+    dns_local_server: SupportLevel::Supported,
+    dns_resolver_integration: SupportLevel::Unsupported,
+    note: "Windows backend: experimental wireguard; advanced routing/resolver/service integration pending",
+};
+
+#[cfg(all(not(target_os = "linux"), not(target_os = "macos"), not(target_os = "windows")))]
+const PORTABLE_CAPABILITIES: DataPlaneCapabilities = DataPlaneCapabilities {
+    wireguard: SupportLevel::Unsupported,
     advertised_routes: SupportLevel::Unsupported,
     advanced_route_policy: SupportLevel::Unsupported,
     router_mode: SupportLevel::Unsupported,
     dns_local_server: SupportLevel::Supported,
     dns_resolver_integration: SupportLevel::Unsupported,
-    note: "portable backend: experimental wireguard only; advanced routing/service integration pending",
+    note: "portable backend: control-plane and local DNS only; wireguard data-plane is not implemented for this OS",
 };
 
 pub fn ensure_supported(level: SupportLevel, feature: &str, command_name: &str) -> Result<()> {
@@ -403,12 +427,32 @@ impl RouteManager for PortableRouteManager {
     async fn apply_advertised_routes(
         &self,
         _netmap: &NetMap,
-        _cfg: &routes::RouteApplyConfig,
+        cfg: &routes::RouteApplyConfig,
     ) -> Result<()> {
-        Err(anyhow!(
-            "advertised route programming is unsupported on this platform"
-        ))
+        validate_portable_route_policy(cfg)?;
+        static ROUTE_NOTICE_ONCE: Once = Once::new();
+        ROUTE_NOTICE_ONCE.call_once(|| {
+            eprintln!(
+                "portable route mode: relying on wireguard backend peer routing; advanced policy routing flags are unavailable"
+            );
+        });
+        Ok(())
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn validate_portable_route_policy(cfg: &routes::RouteApplyConfig) -> Result<()> {
+    if cfg.route_table.is_some() {
+        return Err(anyhow!(
+            "portable route mode does not support --route-table; policy routing tables are linux-only"
+        ));
+    }
+    if cfg.exit_node_uid_range.is_some() {
+        return Err(anyhow!(
+            "portable route mode does not support --exit-node-uid-range; uid-based routing policy is linux-only"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]

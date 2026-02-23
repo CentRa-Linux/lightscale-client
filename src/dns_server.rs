@@ -8,9 +8,18 @@ use std::sync::{Arc, Mutex};
 use tokio::net::UdpSocket;
 #[cfg(target_os = "linux")]
 use {
-    zbus::blocking::{Connection, Proxy},
     std::ffi::CString,
+    zbus::blocking::{Connection, Proxy},
 };
+#[cfg(target_os = "macos")]
+use std::path::Path;
+
+#[cfg(target_os = "macos")]
+const MACOS_RESOLVER_DIR: &str = "/etc/resolver";
+#[cfg(target_os = "macos")]
+const MACOS_MANAGED_MARKER: &str = "# managed-by: lightscale-client";
+#[cfg(target_os = "macos")]
+const MACOS_INTERFACE_MARKER_PREFIX: &str = "# interface: ";
 
 const DNS_TTL_SECONDS: u32 = 30;
 
@@ -45,13 +54,17 @@ pub async fn serve(addr: SocketAddr, state: Arc<Mutex<NetMap>>) -> Result<()> {
 pub fn apply_resolver(interface: &str, domain: &str, server: IpAddr) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        return apply_resolver_resolved(interface, domain, server);
+        apply_resolver_resolved(interface, domain, server)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        apply_resolver_macos(interface, domain, server)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (interface, domain, server);
         Err(anyhow!(
-            "resolver integration is only supported on linux at the moment"
+            "resolver integration is not implemented on this platform yet"
         ))
     }
 }
@@ -59,13 +72,17 @@ pub fn apply_resolver(interface: &str, domain: &str, server: IpAddr) -> Result<(
 pub fn clear_resolver(interface: &str) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        return clear_resolver_resolved(interface);
+        clear_resolver_resolved(interface)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        clear_resolver_macos(interface)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = interface;
         Err(anyhow!(
-            "resolver integration is only supported on linux at the moment"
+            "resolver integration is not implemented on this platform yet"
         ))
     }
 }
@@ -137,6 +154,68 @@ fn encode_ip(ip: IpAddr) -> (i32, Vec<u8>) {
         IpAddr::V4(addr) => (libc::AF_INET, addr.octets().to_vec()),
         IpAddr::V6(addr) => (libc::AF_INET6, addr.octets().to_vec()),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn apply_resolver_macos(interface: &str, domain: &str, server: IpAddr) -> Result<()> {
+    let domain = normalize_macos_domain(domain)?;
+    let dir = Path::new(MACOS_RESOLVER_DIR);
+    std::fs::create_dir_all(dir).context("failed to create /etc/resolver directory")?;
+    let path = dir.join(&domain);
+    let content = format!(
+        "{managed}\n{iface_prefix}{iface}\nnameserver {server}\n",
+        managed = MACOS_MANAGED_MARKER,
+        iface_prefix = MACOS_INTERFACE_MARKER_PREFIX,
+        iface = interface,
+        server = server
+    );
+    std::fs::write(&path, content)
+        .with_context(|| format!("failed to write resolver file {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn clear_resolver_macos(interface: &str) -> Result<()> {
+    let dir = Path::new(MACOS_RESOLVER_DIR);
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).context("failed to list /etc/resolver"),
+    };
+    let interface_marker = format!("{prefix}{iface}", prefix = MACOS_INTERFACE_MARKER_PREFIX, iface = interface);
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let has_managed_marker = content
+            .lines()
+            .any(|line| line.trim() == MACOS_MANAGED_MARKER);
+        let has_interface_marker = content
+            .lines()
+            .any(|line| line.trim() == interface_marker);
+        if has_managed_marker && has_interface_marker {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("failed to remove resolver file {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn normalize_macos_domain(domain: &str) -> Result<String> {
+    let domain = domain.trim().trim_end_matches('.').to_lowercase();
+    if domain.is_empty() {
+        return Err(anyhow!("dns domain cannot be empty"));
+    }
+    if domain.contains('/') || domain.contains('\\') {
+        return Err(anyhow!("dns domain contains invalid path separator"));
+    }
+    Ok(domain)
 }
 
 fn build_response(request: &Message, state: &Arc<Mutex<NetMap>>) -> Result<Message> {

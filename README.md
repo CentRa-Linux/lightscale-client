@@ -199,6 +199,11 @@ and verify `"data_plane"` support before running `wg-up`/`agent`.
 For detailed feature gates (routes/resolver/daemon/service), check
 `"data_plane_capabilities"` in the same JSON output.
 
+On non-Linux platforms:
+- advertised route programming is currently partial (WireGuard peer routing based)
+- advanced policy route controls (`--route-table`, `--exit-node-uid-range`) are Linux-only
+- resolver integration is currently implemented on Linux and macOS
+
 Official support tiers (Linux full client, desktop control-plane tier, mobile
 integration contract) are documented in `../docs/platform-support.md`.
 
