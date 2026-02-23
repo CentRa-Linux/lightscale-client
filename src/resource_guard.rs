@@ -44,12 +44,18 @@ impl PidFileGuard {
 
     #[cfg(unix)]
     fn process_exists(pid: u32) -> bool {
-        use std::process::Command;
-        Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false)
+        let Ok(raw_pid) = i32::try_from(pid) else {
+            return false;
+        };
+        // kill(pid, 0) does not send a signal; it only checks process existence/permissions.
+        let rc = unsafe { libc::kill(raw_pid, 0) };
+        if rc == 0 {
+            return true;
+        }
+        matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EPERM)
+        )
     }
 
     #[cfg(not(unix))]

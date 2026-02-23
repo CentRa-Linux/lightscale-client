@@ -6,6 +6,11 @@ use hickory_proto::rr::{Name, RData, Record, RecordType};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use tokio::net::UdpSocket;
+#[cfg(target_os = "linux")]
+use {
+    zbus::blocking::{Connection, Proxy},
+    std::ffi::CString,
+};
 
 const DNS_TTL_SECONDS: u32 = 30;
 
@@ -38,28 +43,100 @@ pub async fn serve(addr: SocketAddr, state: Arc<Mutex<NetMap>>) -> Result<()> {
 }
 
 pub fn apply_resolver(interface: &str, domain: &str, server: IpAddr) -> Result<()> {
-    let domain = domain.trim_end_matches('.');
-    let routed_domain = format!("~{}", domain);
-    run_resolvectl(&["dns", interface, &server.to_string()])?;
-    run_resolvectl(&["domain", interface, &routed_domain])?;
-    Ok(())
+    #[cfg(target_os = "linux")]
+    {
+        return apply_resolver_resolved(interface, domain, server);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (interface, domain, server);
+        Err(anyhow!(
+            "resolver integration is only supported on linux at the moment"
+        ))
+    }
 }
 
 pub fn clear_resolver(interface: &str) -> Result<()> {
-    run_resolvectl(&["revert", interface])
+    #[cfg(target_os = "linux")]
+    {
+        return clear_resolver_resolved(interface);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = interface;
+        Err(anyhow!(
+            "resolver integration is only supported on linux at the moment"
+        ))
+    }
 }
 
-fn run_resolvectl(args: &[&str]) -> Result<()> {
-    let output = std::process::Command::new("resolvectl").args(args).output();
-    let output = match output {
-        Ok(output) => output,
-        Err(err) => return Err(anyhow!("resolvectl failed: {}", err)),
-    };
-    if output.status.success() {
-        return Ok(());
+#[cfg(target_os = "linux")]
+fn apply_resolver_resolved(interface: &str, domain: &str, server: IpAddr) -> Result<()> {
+    let ifindex = interface_index(interface)?;
+    let conn = Connection::system().context("connect to system D-Bus failed")?;
+    let manager = Proxy::new(
+        &conn,
+        "org.freedesktop.resolve1",
+        "/org/freedesktop/resolve1",
+        "org.freedesktop.resolve1.Manager",
+    )
+    .context("build resolved manager proxy failed")?;
+
+    let (family, bytes) = encode_ip(server);
+    let dns_entries = vec![(family, bytes)];
+    manager
+        .call_method("SetLinkDNS", &(ifindex, dns_entries))
+        .context("resolved SetLinkDNS failed")?;
+
+    let normalized_domain = domain.trim_end_matches('.');
+    if !normalized_domain.is_empty() {
+        // Routing-only domain (equivalent to resolvectl's "~domain" behavior).
+        let domains = vec![(normalized_domain.to_string(), true)];
+        manager
+            .call_method("SetLinkDomains", &(ifindex, domains))
+            .context("resolved SetLinkDomains failed")?;
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Err(anyhow!("resolvectl failed: {}", stderr.trim()))
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn clear_resolver_resolved(interface: &str) -> Result<()> {
+    let ifindex = interface_index(interface)?;
+    let conn = Connection::system().context("connect to system D-Bus failed")?;
+    let manager = Proxy::new(
+        &conn,
+        "org.freedesktop.resolve1",
+        "/org/freedesktop/resolve1",
+        "org.freedesktop.resolve1.Manager",
+    )
+    .context("build resolved manager proxy failed")?;
+    manager
+        .call_method("RevertLink", &(ifindex,))
+        .context("resolved RevertLink failed")?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn interface_index(interface: &str) -> Result<i32> {
+    let c_name =
+        CString::new(interface).map_err(|_| anyhow!("interface name contains invalid null byte"))?;
+    let idx = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
+    if idx == 0 {
+        return Err(anyhow!(
+            "failed to resolve interface index for {}: {}",
+            interface,
+            std::io::Error::last_os_error()
+        ));
+    }
+    i32::try_from(idx).map_err(|_| anyhow!("interface index overflow for {}", interface))
+}
+
+#[cfg(target_os = "linux")]
+fn encode_ip(ip: IpAddr) -> (i32, Vec<u8>) {
+    match ip {
+        IpAddr::V4(addr) => (libc::AF_INET, addr.octets().to_vec()),
+        IpAddr::V6(addr) => (libc::AF_INET6, addr.octets().to_vec()),
+    }
 }
 
 fn build_response(request: &Message, state: &Arc<Mutex<NetMap>>) -> Result<Message> {
